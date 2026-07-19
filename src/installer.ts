@@ -20,6 +20,7 @@ const PROGRESS_EVENTS = [
   'Stop', 'StopFailure',
   'SessionStart', 'SessionEnd',
   'SubagentStart', 'SubagentStop',
+  'Interrupt',
 ];
 
 export function detectKimiConfig(): string {

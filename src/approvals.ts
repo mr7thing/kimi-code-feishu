@@ -22,6 +22,12 @@ export interface Approval {
   result: ApprovalResult | null;
   resolve: (r: ApprovalResult) => void;
   promise: Promise<ApprovalResult>;
+  /** AskUserQuestion 答题状态：questions 已拍平为选项数组；sel 为多选暂存，answers 为定稿答案 */
+  auq?: {
+    questions: Array<{ question: string; header?: string; multi: boolean; options: string[] }>;
+    sel: Array<Set<string>>;
+    answers: Array<string[] | null>;
+  };
 }
 
 export class ApprovalManager {
@@ -48,6 +54,11 @@ export class ApprovalManager {
 
   isSessionAllowed(sessionId: string, toolName: string): boolean {
     return this.sessionAllowed.has(`${sessionId}\0${toolName}`);
+  }
+
+  /** 取待处理请求（飞书答题需要中途读取/累积选择，而非一次 decide）。 */
+  get(reqId: string): Approval | undefined {
+    return this.pending.get(reqId);
   }
 
   decide(reqId: string, decision: Decision, operator = ''): Approval | undefined {

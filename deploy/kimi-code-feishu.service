@@ -1,0 +1,15 @@
+# kimi-code-feishu 桥服务 systemd --user 单元
+# 由 deploy/install-service.sh 渲染安装，也可手工复制到 ~/.config/systemd/user/ 并把 __BIN__ 换成实际路径
+[Unit]
+Description=kimi-code-feishu bridge (Feishu <-> Kimi Code CLI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__BIN__ run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

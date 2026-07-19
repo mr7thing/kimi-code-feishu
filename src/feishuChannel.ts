@@ -26,6 +26,8 @@ export class FeishuChannel implements Channel {
     const eventDispatcher = new Lark.EventDispatcher({ loggerLevel: Lark.LoggerLevel.warn }).register({
       'im.message.receive_v1': async (data: unknown) => this.handleMessageEvent(data),
       'card.action.trigger': async (data: unknown) => this.handleCardAction(data),
+      // 模板默认订阅了已读事件，注册空处理器避免 SDK 刷 "no handle" 警告
+      'im.message.message_read_v1': async () => {},
     });
 
     // 注意：旧版 SDK 的 WSClient.reConnect() 有定时器泄漏 bug（上游 #177）。
@@ -76,14 +78,16 @@ export class FeishuChannel implements Channel {
     }
   }
 
-  /** 审批按钮回调：返回 toast 给点击者即时反馈。 */
-  private handleCardAction(data: unknown): { toast: { type: string; content: string } } {
+  /** 审批按钮回调：返回 toast + 结果卡片（内联更新是全端同步的唯一可靠途径）。 */
+  private handleCardAction(data: unknown): Record<string, unknown> {
     try {
       const event = (data as Record<string, unknown>) ?? {};
       const value = ((event.action as Record<string, unknown>)?.value ?? {}) as Record<string, unknown>;
       const operator = String((event.operator as Record<string, unknown>)?.open_id ?? '');
-      this.onCardAction(value, operator);
-      return { toast: { type: 'success', content: '已收到你的选择' } };
+      const card = this.onCardAction(value, operator);
+      const resp: Record<string, unknown> = { toast: { type: 'success', content: '已收到你的选择' } };
+      if (card) resp.card = { type: 'raw', data: card };
+      return resp;
     } catch (err) {
       console.error('[feishu] 处理卡片回调失败:', err);
       return { toast: { type: 'error', content: '处理失败，请查看桥服务日志' } };
@@ -128,25 +132,34 @@ export class FeishuChannel implements Channel {
   }
 
   // ---------------- 更新 ----------------
+  // 注意：飞书的两个"更新"接口分工不同——
+  //   message.update（PUT）编辑文本/富文本消息；
+  //   message.patch 只更新卡片消息（对文本消息报 230001 "NOT a card"）。
   async updateText(messageId: string, text: string): Promise<void> {
-    await this.patch(messageId, JSON.stringify({ text }));
+    if (!messageId) return;
+    try {
+      const resp = await this.client.im.v1.message.update({
+        path: { message_id: messageId },
+        data: { msg_type: 'text', content: JSON.stringify({ text }) },
+      });
+      const r = resp as unknown as { code?: number; msg?: string };
+      if (r.code !== 0) console.warn(`[feishu] 编辑消息失败: code=${r.code} msg=${r.msg}`);
+    } catch (err) {
+      console.warn('[feishu] 编辑消息异常:', (err as Error)?.message ?? err);
+    }
   }
 
   async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
-    await this.patch(messageId, JSON.stringify(card));
-  }
-
-  private async patch(messageId: string, content: string): Promise<void> {
     if (!messageId) return;
     try {
       const resp = await this.client.im.v1.message.patch({
         path: { message_id: messageId },
-        data: { content },
+        data: { content: JSON.stringify(card) },
       });
       const r = resp as unknown as { code?: number; msg?: string };
-      if (r.code !== 0) console.warn(`[feishu] 更新消息失败: code=${r.code} msg=${r.msg}`);
+      if (r.code !== 0) console.warn(`[feishu] 更新卡片失败: code=${r.code} msg=${r.msg}`);
     } catch (err) {
-      console.warn('[feishu] 更新消息异常:', err);
+      console.warn('[feishu] 更新卡片异常:', (err as Error)?.message ?? err);
     }
   }
 }

@@ -15,6 +15,7 @@ import { ApprovalManager } from './approvals.js';
 import { pollAppRegistration, RegistrationError, requestAppRegistration } from './appRegistration.js';
 import { Bridge, toolInputSummary } from './bridge.js';
 import { loadConfig, saveConfig } from './config.js';
+import { Dashboard, serveDashboard } from './dashboard.js';
 import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
 import { StateStore } from './state.js';
@@ -133,6 +134,11 @@ async function main(): Promise<void> {
     check('解析器: 工具调用', ev2?.kind === 'tool_call' && ev2.tool === 'Shell');
     check('解析器: 非 JSON 行降级 raw', parseLine('not json at all')?.kind === 'raw');
     check('解析器: 空行返回 null', parseLine('') === null);
+    // 真实 stream-json 格式（OpenAI 风格 role 字段）
+    const ev3 = parseLine('{"role":"assistant","content":"我先看看","tool_calls":[{"type":"function","function":{"name":"Bash"}}]}');
+    check('解析器: role=assistant 带 tool_calls', ev3?.kind === 'tool_call' && ev3.tool === 'Bash' && ev3.text === '我先看看');
+    const ev4 = parseLine('{"role":"tool","tool_call_id":"x","content":"file1\\nfile2"}');
+    check('解析器: role=tool 工具返回', ev4?.kind === 'tool_result' && (ev4.text ?? '').includes('file1'));
   }
 
   // ---------------------------------------------------------------- 3. 审批管理器
@@ -164,7 +170,7 @@ async function main(): Promise<void> {
     check('安装器: hook 命令指向本包 hook.js', text.includes('hook.js pre_tool_use'));
     // 回归：写出的必须是合法 TOML，且转义后命令里的 KCF_CONFIG 保持完整
     const parsed = parseToml(text) as { hooks?: Array<{ command?: string }> };
-    check('安装器: 生成的 TOML 可解析', Array.isArray(parsed.hooks) && parsed.hooks.length === 9);
+    check('安装器: 生成的 TOML 可解析', Array.isArray(parsed.hooks) && parsed.hooks.length === 10);
     check('安装器: 解析后 KCF_CONFIG 完整', (parsed.hooks?.[0]?.command ?? '').includes('KCF_CONFIG="/tmp/x/config.toml"'));
     let threw = false;
     try { installer.install(kimiCfg); } catch { threw = true; }
@@ -199,15 +205,20 @@ async function main(): Promise<void> {
       session_id: 's1', cwd: tmp, tool_name: 'ReadFile', tool_input: { file_path: '/etc/hostname' },
     });
     check('端到端: 只读工具自动放行', r.stdout.trim() === '' && r.code === 0);
+    r = await runHook(cfgPath, 'pre_tool_use', {
+      session_id: 's1', cwd: tmp, tool_name: 'ReadMediaFile', tool_input: { path: '/tmp/a.png' },
+    });
+    check('端到端: ReadMediaFile 自动放行（真实工具名）', r.stdout.trim() === '' && r.code === 0);
 
     // 5.3 需审批工具：发卡片 → 模拟用户在飞书点"批准"
+    let returnedCard: Record<string, unknown> | null = null;
     const approver = (async () => {
       for (let i = 0; i < 50; i++) {
         const cards = channel.cards();
         if (cards.length >= 1) {
           const actions = (cards[0].elements as Array<Record<string, unknown>>)[2].actions as Array<Record<string, unknown>>;
           await sleep(100);
-          bridge.onCardAction(actions[0].value as Record<string, unknown>, 'ou_boss');
+          returnedCard = bridge.onCardAction(actions[0].value as Record<string, unknown>, 'ou_boss');
           return;
         }
         await sleep(100);
@@ -219,6 +230,8 @@ async function main(): Promise<void> {
     await approver;
     check('端到端: 飞书批准后放行', r.code === 0 && !r.stdout.includes('deny'));
     check('端到端: 发出了审批卡片', channel.cards().length >= 1);
+    check('端到端: 回调内联返回结果卡片', !!returnedCard && JSON.stringify(returnedCard).includes('已批准'));
+    check('端到端: 卡片声明 update_multi', JSON.stringify(channel.cards()[0]).includes('"update_multi":true'));
     await sleep(200);
     check('端到端: 卡片已更新为结果', channel.updated.length >= 1);
 
@@ -279,6 +292,93 @@ async function main(): Promise<void> {
     await bridge.onFeishuMessage('chat-1', 'ou_boss', '/status');
     check('命令: /status 有响应', channel.texts().some((t) => t.includes('状态')));
 
+    // 5.8 Interrupt 事件 → 飞书通知
+    await runHook(cfgPath, 'interrupt', { session_id: 's9', cwd: tmp });
+    await sleep(300);
+    check('端到端: Interrupt 事件通知到飞书', channel.texts().some((t) => t.includes('中断')));
+
+    // 5.9 飞书答题：AskUserQuestion 选项卡片
+    const auqButtons = (card: Record<string, unknown>): Array<Record<string, unknown>> => {
+      const out: Array<Record<string, unknown>> = [];
+      for (const el of (card.elements ?? []) as Array<Record<string, unknown>>) {
+        if (el.tag !== 'action') continue;
+        for (const a of (el.actions ?? []) as Array<Record<string, unknown>>) {
+          if ((a.value as Record<string, unknown>)?.kcf === 'auq') out.push(a);
+        }
+      }
+      return out;
+    };
+    const auqCards = () => channel.cards().filter((c) => auqButtons(c).length > 0);
+    const clickAuq = async (match: (v: Record<string, unknown>) => boolean, cardIdx: number) => {
+      for (let i = 0; i < 50; i++) {
+        const cards = auqCards();
+        if (cards.length > cardIdx) {
+          const btn = auqButtons(cards[cardIdx]).find((b) => match(b.value as Record<string, unknown>));
+          if (btn) {
+            await sleep(50);
+            bridge.onCardAction(btn.value as Record<string, unknown>, 'ou_boss');
+            return true;
+          }
+        }
+        await sleep(100);
+      }
+      return false;
+    };
+
+    // 单题：点击选项 → deny + 答案理由
+    let answerer = clickAuq((v) => v.a === '方案B', 0);
+    r = await runHook(cfgPath, 'pre_tool_use', {
+      session_id: 's1', cwd: tmp, tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: '用哪个方案？', options: [{ label: '方案A' }, { label: '方案B' }] }] },
+    });
+    check('答题: 单题作答以 deny+答案理由 回传', (await answerer) && isDeny(r.stdout) && r.stdout.includes('方案B'));
+
+    // 拒绝回答
+    answerer = clickAuq((v) => v.d === 'deny', 1);
+    r = await runHook(cfgPath, 'pre_tool_use', {
+      session_id: 's1', cwd: tmp, tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: '继续吗？', options: [{ label: '是' }, { label: '否' }] }] },
+    });
+    check('答题: 拒绝回答输出 deny', (await answerer) && isDeny(r.stdout) && r.stdout.includes('拒绝回答'));
+
+    // 多题：两题各选一个 → 理由含两个答案
+    const twoQ = (async () => {
+      const ok1 = await clickAuq((v) => v.q === 0 && v.a === '甲', 2);
+      const ok2 = await clickAuq((v) => v.q === 1 && v.a === '丁', 2);
+      return ok1 && ok2;
+    })();
+    r = await runHook(cfgPath, 'pre_tool_use', {
+      session_id: 's1', cwd: tmp, tool_name: 'AskUserQuestion',
+      tool_input: {
+        questions: [
+          { question: '第一题？', options: [{ label: '甲' }, { label: '乙' }] },
+          { question: '第二题？', options: [{ label: '丙' }, { label: '丁' }] },
+        ],
+      },
+    });
+    check('答题: 多题集齐答案后回传', (await twoQ) && isDeny(r.stdout) && r.stdout.includes('甲') && r.stdout.includes('丁'));
+
+    // 5.10 配置 dashboard_public_url 后审批卡片带链接
+    cfg.dashboardPublicUrl = 'https://dash.example.com';
+    cfg.dashboardToken = 'tok-xyz';
+    const linkApprover = (async () => {
+      for (let i = 0; i < 50; i++) {
+        const cards = channel.cards();
+        const last = cards[cards.length - 1];
+        if (last && JSON.stringify(last).includes('dash.example.com')) {
+          const actions = (last.elements as Array<Record<string, unknown>>)[2].actions as Array<Record<string, unknown>>;
+          bridge.onCardAction(actions[0].value as Record<string, unknown>, 'ou_boss');
+          return true;
+        }
+        await sleep(100);
+      }
+      return false;
+    })();
+    r = await runHook(cfgPath, 'pre_tool_use', {
+      session_id: 's1', cwd: tmp, tool_name: 'Shell', tool_input: { command: 'make release' },
+    });
+    check('端到端: 审批卡片带 Dashboard 链接', (await linkApprover) && !isDeny(r.stdout));
+
     await hookServer.close();
   }
 
@@ -296,10 +396,11 @@ async function main(): Promise<void> {
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kcf-task-'));
     const fakeKimi = path.join(tmp, 'fake_kimi');
+    // 用真实 stream-json 格式（role 风格）输出，覆盖与线上一致的解析路径
     fs.writeFileSync(fakeKimi, `#!/bin/sh
-echo '{"type":"assistant","message":{"content":[{"type":"text","text":"正在分析…"}]}}'
-echo '{"type":"tool_use","name":"Shell"}'
-echo '{"type":"assistant","message":{"content":[{"type":"text","text":"完成：一切正常"}]}}'
+echo '{"role":"assistant","content":"正在分析…","tool_calls":[{"type":"function","function":{"name":"Bash"}}]}'
+echo '{"role":"tool","tool_call_id":"t1","content":"ok"}'
+echo '{"role":"assistant","content":"完成：一切正常"}'
 `, 'utf-8');
     fs.chmodSync(fakeKimi, 0o755);
 
@@ -319,6 +420,8 @@ echo '{"type":"assistant","message":{"content":[{"type":"text","text":"完成：
     check('任务: 流式执行并回报结果', done);
     check('任务: 会话标记已置位', state.hasSession('chat-9'));
     check('任务: 有执行中消息', channel.texts().some((t) => t.includes('执行中') || t.includes('已开工')));
+    check('任务: 进度消息被更新（工具行）', channel.updated.length >= 1);
+    check('任务: 工具返回不混入最终结果', !channel.texts().some((t) => t.includes('任务完成') && t.includes('ok')));
   }
 
   // ---------------------------------------------------------------- 8. 扫码注册流程（mock accounts 服务）
@@ -370,6 +473,30 @@ echo '{"type":"assistant","message":{"content":[{"type":"text","text":"完成：
     }
     check('注册: access_denied 正确抛出', denied);
     await new Promise<void>((r) => srv.close(() => r()));
+  }
+
+  // ---------------------------------------------------------------- 9. Dashboard
+  {
+    const dash = new Dashboard();
+    const port = await freePort();
+    const srv = await serveDashboard(dash, '127.0.0.1', port, 'tok123', { idleTimeoutMs: 600_000, onClose: () => {} });
+    const base = `http://127.0.0.1:${port}`;
+
+    const r1 = await fetch(`${base}/events`);
+    check('Dashboard: 无 token 拒绝访问', r1.status === 401);
+
+    const r2 = await fetch(`${base}/?token=tok123`);
+    const html = await r2.text();
+    check('Dashboard: 带 token 返回 HTML 页面', r2.status === 200 && html.includes('<html'));
+
+    dash.publish('chat-dash', 'stdout', 'hello-dashboard-xyz');
+    const ac = new AbortController();
+    const r3 = await fetch(`${base}/events?token=tok123`, { signal: ac.signal });
+    const reader = r3.body!.getReader();
+    const { value } = await reader.read();
+    ac.abort();
+    check('Dashboard: SSE 回放到已发布事件', new TextDecoder().decode(value).includes('hello-dashboard-xyz'));
+    await srv.close();
   }
 
   // ---------------------------------------------------------------- 汇总

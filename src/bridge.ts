@@ -10,6 +10,7 @@ import type { Approval, ApprovalManager as AM } from './approvals.js';
 import { ApprovalManager } from './approvals.js';
 import type { Channel } from './channel.js';
 import type { Config } from './config.js';
+import type { Dashboard } from './dashboard.js';
 import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
 import type { StreamEvent } from './streamParser.js';
@@ -36,7 +37,38 @@ export function toolInputSummary(payload: Record<string, unknown>, limit = 1200)
   }
 }
 
+/** 审批决定的展示文案（卡片回调内联返回与 resolve 更新共用，防止漂移）。 */
+function decidedTextFor(decision: string): string | null {
+  if (decision === 'allow') return '✅ 已批准';
+  if (decision === 'allow_session') return '✅ 已批准（本会话同类自动放行）';
+  if (decision === 'deny') return '❌ 已拒绝';
+  return null;
+}
+
 type HookResponse = { decision: string; reason?: string };
+
+type AuqQuestion = { question: string; header?: string; multi: boolean; options: string[] };
+
+/** 解析 AskUserQuestion 的 tool_input；解析不出有效问题返回空数组（调用方回退普通审批）。 */
+export function parseAuqQuestions(ti: unknown): AuqQuestion[] {
+  if (!ti || typeof ti !== 'object' || Array.isArray(ti)) return [];
+  const qs = (ti as Record<string, unknown>).questions;
+  if (!Array.isArray(qs)) return [];
+  const out: AuqQuestion[] = [];
+  for (const q of qs.slice(0, 4)) {
+    if (!q || typeof q !== 'object') continue;
+    const rec = q as Record<string, unknown>;
+    const question = String(rec.question ?? '').trim();
+    const options = (Array.isArray(rec.options) ? rec.options : [])
+      .map((o) => String((o as Record<string, unknown>)?.label ?? '').trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (!question || options.length < 2) continue;
+    const header = String(rec.header ?? '').trim();
+    out.push({ question, header: header || undefined, multi: rec.multi_select === true, options });
+  }
+  return out;
+}
 
 interface ProgressState {
   messageId?: string;
@@ -51,14 +83,17 @@ export class Bridge {
   channel!: Channel;
   private progress = new Map<string, ProgressState>();
   private taskMessages = new Map<string, string>();
+  private taskMsgPending = new Map<string, Promise<string | undefined>>();
+  private taskStatus = new Map<string, { text?: string; tool?: string; lastPush: number }>();
 
   constructor(
     private cfg: Config,
     private state: StateStore,
     channel?: Channel,
+    private dashboard?: Dashboard,
   ) {
     if (channel) this.channel = channel;
-    this.runner = new KimiRunner(cfg, state, this);
+    this.runner = new KimiRunner(cfg, state, this, (chatId, kind, text) => this.dashboard?.publish(chatId, kind, text));
   }
 
   // ================================================================
@@ -81,6 +116,12 @@ export class Bridge {
       }
     }
 
+    // 2.5) AskUserQuestion：把问题渲染成飞书选项卡片，作答后以 deny+理由 回传答案
+    if (tool === 'AskUserQuestion') {
+      const r = await this.handleAskUserQuestion(payload);
+      if (r) return r; // null = 问题格式无法解析，回退为普通审批卡
+    }
+
     // 3) 用户之前点过"本会话允许"
     if (this.approvals.isSessionAllowed(sessionId, tool)) return { decision: 'allow', reason: 'session_allowed' };
 
@@ -100,6 +141,7 @@ export class Bridge {
       console.error('[bridge] 发送审批卡片失败:', err);
     }
     if (!ap.messageId) return this.timeoutDecision('审批卡片发送失败');
+    this.dashboard?.publish(chatId, 'progress', `🔐 审批请求：${tool} — ${truncate(summary, 200)}`);
 
     const result = await this.approvals.wait(ap, this.cfg.approvalTimeout * 1000);
     return this.resolve(ap, result.decision, result.operator);
@@ -113,10 +155,10 @@ export class Bridge {
       decidedText = '⏰ 超时自动' + (resp.decision === 'deny' ? '拒绝' : '放行');
     } else if (decision === 'allow' || decision === 'allow_session') {
       resp = { decision: 'allow', reason: `approved by ${operator}` };
-      decidedText = '✅ 已批准' + (decision === 'allow_session' ? '（本会话同类自动放行）' : '');
+      decidedText = decidedTextFor(decision)!;
     } else {
       resp = { decision: 'deny', reason: `用户在飞书上拒绝了 ${ap.toolName}` };
-      decidedText = '❌ 已拒绝';
+      decidedText = decidedTextFor(decision)!;
     }
     if (ap.messageId) {
       try {
@@ -125,12 +167,161 @@ export class Bridge {
         console.error('[bridge] 更新审批卡片失败:', err);
       }
     }
+    if (ap.chatId) this.dashboard?.publish(ap.chatId, 'progress', `${decidedText}：${ap.toolName}${operator ? `（${operator}）` : ''}`);
     return resp;
   }
 
   private timeoutDecision(reason: string): HookResponse {
     if (this.cfg.onTimeout === 'allow') return { decision: 'allow', reason };
     return { decision: 'deny', reason: `飞书审批超时：${reason}` };
+  }
+
+  // ================================================================
+  // AskUserQuestion：飞书答题
+  // hook 协议无法把用户输入回传给工具，做法是：选项做成飞书按钮，
+  // 集齐答案后 hook 返回 deny + 理由（理由进上下文，模型拿答案继续）。
+  // ================================================================
+  private async handleAskUserQuestion(payload: Record<string, unknown>): Promise<HookResponse | null> {
+    const questions = parseAuqQuestions(payload.tool_input);
+    if (!questions.length) return null;
+
+    const chatId = this.routeChat(payload);
+    if (!chatId) return this.timeoutDecision('尚未有任何飞书聊天与桥绑定（先给机器人发条消息）');
+
+    const ap = this.approvals.create(payload);
+    ap.chatId = chatId;
+    ap.auq = { questions, sel: questions.map(() => new Set<string>()), answers: questions.map(() => null) };
+    try {
+      ap.messageId = await this.channel.sendCard(chatId, this.auqCard(ap));
+    } catch (err) {
+      console.error('[bridge] 发送提问卡片失败:', err);
+    }
+    if (!ap.messageId) return this.timeoutDecision('提问卡片发送失败');
+    this.dashboard?.publish(chatId, 'progress', `❓ 模型提问：${truncate(questions.map((q) => q.question).join('；'), 200)}`);
+
+    const result = await this.approvals.wait(ap, this.cfg.approvalTimeout * 1000);
+    if (result.decision === null) {
+      await this.updateCardQuiet(ap, this.auqResultCard(ap, '⏰ 超时未作答'));
+      return this.timeoutDecision(`${this.cfg.approvalTimeout}s 未作答`);
+    }
+    if (result.decision === 'deny') {
+      await this.updateCardQuiet(ap, this.auqResultCard(ap, '🚫 用户拒绝回答'));
+      return { decision: 'deny', reason: '用户拒绝回答该提问。请不要再问同一问题，自行决定或换个方案继续。' };
+    }
+    const qa = questions.map((q, i) => `Q${i + 1}「${q.question}」答：${(ap.auq!.answers[i] ?? []).join('、')}`).join('\n');
+    await this.updateCardQuiet(ap, this.auqResultCard(ap, '✅ 已作答', qa));
+    this.dashboard?.publish(chatId, 'progress', `✅ 飞书作答：${truncate(qa, 200)}`);
+    return {
+      decision: 'deny',
+      reason: `注意：该提问已由用户通过飞书远程作答（本次工具调用被拒绝是预期行为，并非用户不愿回答）。\n${qa}\n请以上述回答为准继续工作，不要再次询问同一问题。`,
+    };
+  }
+
+  private async updateCardQuiet(ap: Approval, card: Record<string, unknown>): Promise<void> {
+    if (!ap.messageId) return;
+    try {
+      await this.channel.updateCard(ap.messageId, card);
+    } catch (err) {
+      console.error('[bridge] 更新卡片失败:', err);
+    }
+  }
+
+  private async handleAuqClick(value: Record<string, unknown>, operator: string): Promise<void> {
+    const reqId = String(value.req_id ?? '');
+    const ap = this.approvals.get(reqId);
+    if (!ap?.auq) {
+      console.info(`[bridge] 答题 ${reqId} 已处理或不存在（可能超时/重复点击）`);
+      return;
+    }
+    if (String(value.d ?? '') === 'deny') {
+      this.approvals.decide(reqId, 'deny', operator);
+      return;
+    }
+    const q = Number(value.q);
+    const a = String(value.a ?? '');
+    const auq = ap.auq;
+    if (!Number.isInteger(q) || q < 0 || q >= auq.questions.length || auq.answers[q]) return;
+    const sel = auq.sel[q];
+    if (a === '__confirm__') {
+      if (!sel.size) return;
+      auq.answers[q] = [...sel];
+    } else if (auq.questions[q].multi) {
+      if (sel.has(a)) sel.delete(a);
+      else sel.add(a);
+    } else {
+      auq.answers[q] = [a];
+    }
+    // 全部题答完 → 结束挂起；否则更新卡片显示已选状态
+    if (auq.answers.every((ans) => ans && ans.length > 0)) {
+      this.approvals.decide(reqId, 'allow', operator);
+      return;
+    }
+    if (ap.messageId) {
+      try {
+        await this.channel.updateCard(ap.messageId, this.auqCard(ap));
+      } catch (err) {
+        console.error('[bridge] 更新答题卡片失败:', err);
+      }
+    }
+  }
+
+  // ---------------- 提问卡片 ----------------
+  private auqCard(ap: Approval): Record<string, unknown> {
+    const auq = ap.auq!;
+    const elements: unknown[] = [];
+    auq.questions.forEach((q, qi) => {
+      const head = `**Q${qi + 1}${q.multi ? '（多选，选完点确认）' : ''}：${truncate(q.question, 400)}**`;
+      elements.push({ tag: 'div', text: { tag: 'lark_md', content: q.header ? `${head}\n${q.header}` : head } });
+      const answered = auq.answers[qi];
+      if (answered) {
+        elements.push({ tag: 'div', text: { tag: 'lark_md', content: `✅ 已选：**${answered.join('、')}**` } });
+        return;
+      }
+      const btns = q.options.map((opt) => ({
+        tag: 'button',
+        text: { tag: 'plain_text', content: truncate(auq.sel[qi].has(opt) ? `✅ ${opt}` : opt, 30) },
+        type: auq.sel[qi].has(opt) ? 'primary' : 'default',
+        value: { kcf: 'auq', req_id: ap.reqId, q: qi, a: opt },
+      }));
+      if (q.multi) {
+        btns.push({
+          tag: 'button',
+          text: { tag: 'plain_text', content: '✔️ 确认本题' },
+          type: 'primary',
+          value: { kcf: 'auq', req_id: ap.reqId, q: qi, a: '__confirm__' },
+        });
+      }
+      elements.push({ tag: 'action', actions: btns });
+    });
+    elements.push({
+      tag: 'action',
+      actions: [{ tag: 'button', text: { tag: 'plain_text', content: '🚫 拒绝回答' }, type: 'danger', value: { kcf: 'auq', req_id: ap.reqId, d: 'deny' } }],
+    });
+    const timeoutText = this.cfg.onTimeout === 'deny' ? '拒绝（模型自行决定）' : '放行到终端作答';
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: `${this.cfg.approvalTimeout} 秒未作答将${timeoutText}；自定义答案请点「拒绝回答」后直接在聊天里补充` }] });
+    elements.push(...this.dashNote());
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { template: 'blue', title: { tag: 'plain_text', content: '❓ Kimi Code 等待你的回答' } },
+      elements,
+    };
+  }
+
+  private auqResultCard(ap: Approval, decidedText: string, detail = ''): Record<string, unknown> {
+    const ok = decidedText.startsWith('✅');
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { template: ok ? 'green' : 'red', title: { tag: 'plain_text', content: `❓ 提问 ${decidedText}` } },
+      elements: [{ tag: 'div', text: { tag: 'lark_md', content: truncate(detail || decidedText, 1000) } }],
+    };
+  }
+
+  /** 配置了 dashboard_public_url 时，卡片底部附「查看实时输出」链接。 */
+  private dashNote(): unknown[] {
+    if (!this.cfg.dashboardPublicUrl) return [];
+    const sep = this.cfg.dashboardPublicUrl.includes('?') ? '&' : '?';
+    const url = `${this.cfg.dashboardPublicUrl}${sep}token=${this.cfg.dashboardToken}`;
+    return [{ tag: 'note', elements: [{ tag: 'lark_md', content: `[📊 查看实时输出](${url})` }] }];
   }
 
   // ---------------- 审批卡片 ----------------
@@ -145,7 +336,7 @@ export class Bridge {
       value: { kcf: 'approval', req_id: req.reqId, d },
     });
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { template: 'orange', title: { tag: 'plain_text', content: '🔐 Kimi Code 请求操作权限' } },
       elements: [
         { tag: 'div', text: { tag: 'lark_md', content: `**工具**：\`${tool}\`\n**目录**：${cwd}\n**会话**：${sid}` } },
@@ -159,6 +350,7 @@ export class Bridge {
           ],
         },
         { tag: 'note', elements: [{ tag: 'plain_text', content: `${this.cfg.approvalTimeout} 秒未操作将自动${timeoutText}` }] },
+        ...this.dashNote(),
       ],
     };
   }
@@ -167,7 +359,7 @@ export class Bridge {
     const ok = decidedText.startsWith('✅');
     const summary = toolInputSummary(ap.payload);
     return {
-      config: { wide_screen_mode: true },
+      config: { wide_screen_mode: true, update_multi: true },
       header: { template: ok ? 'green' : 'red', title: { tag: 'plain_text', content: `🔐 权限请求 ${decidedText}` } },
       elements: [
         { tag: 'div', text: { tag: 'lark_md', content: `**工具**：\`${ap.toolName}\`\n**操作者**：${operator ?? '-'}\n\`\`\`\n${summary}\n\`\`\`` } },
@@ -207,15 +399,23 @@ export class Bridge {
     } else if (ev === 'stop') {
       await this.progressFlush(key, true);
       await this.channel.sendText(chatId, '✅ 本轮任务结束');
+      this.dashboard?.publish(chatId, 'progress', '✅ 本轮任务结束');
     } else if (ev === 'stopfailure') {
       await this.progressFlush(key, true);
       await this.channel.sendText(chatId, `⚠️ 本轮出错结束：${truncate(String(payload.error_message ?? ''), 200)}`);
+      this.dashboard?.publish(chatId, 'progress', `⚠️ 本轮出错结束：${truncate(String(payload.error_message ?? ''), 200)}`);
+    } else if (ev === 'interrupt') {
+      await this.progressFlush(key, true);
+      await this.channel.sendText(chatId, '⛔ 本轮被用户中断');
+      this.dashboard?.publish(chatId, 'progress', '⛔ 本轮被用户中断');
     } else if (ev === 'sessionstart') {
       await this.channel.sendText(chatId, `🚀 新会话开始（${payload.source ?? ''}）：${sessionId.slice(0, 12)}`);
+      this.dashboard?.publish(chatId, 'progress', `🚀 新会话开始：${sessionId.slice(0, 12)}`);
     }
   }
 
   private progressLine(key: string, chatId: string, line: string): void {
+    this.dashboard?.publish(chatId, 'progress', line);
     let p = this.progress.get(key);
     if (!p) {
       p = { lines: [], lastUpdate: 0, chatId };
@@ -304,19 +504,53 @@ export class Bridge {
 
   // ---------------- 运行器回调 ----------------
   onTaskStream(chatId: string, event: StreamEvent): void {
+    // 记录最新状态（assistant 说明文本 + 当前工具），占位消息就绪前到的事件不再丢弃
+    const st = this.taskStatus.get(chatId) ?? { lastPush: 0 };
+    this.taskStatus.set(chatId, st);
+    if (event.kind === 'text' && event.text?.trim()) st.text = event.text.trim();
+    else if (event.kind === 'tool_call') {
+      st.tool = event.tool;
+      if (event.text?.trim()) st.text = event.text.trim();
+    }
+
     const mid = this.taskMessages.get(chatId);
     if (!mid) {
-      void this.channel.sendText(chatId, '⏳ Kimi Code 执行中…').then((m) => {
-        if (m) this.taskMessages.set(chatId, m);
-      });
+      // 占位消息只发一次；就绪后立即渲染当前状态
+      if (!this.taskMsgPending.has(chatId)) {
+        const p = this.channel.sendText(chatId, '⏳ Kimi Code 执行中…');
+        this.taskMsgPending.set(chatId, p);
+        void p.then((m) => {
+          this.taskMsgPending.delete(chatId);
+          if (m) {
+            this.taskMessages.set(chatId, m);
+            this.pushTaskStatus(chatId, m, true);
+          }
+        });
+      }
       return;
     }
-    if (event.kind === 'tool_call') {
-      void this.channel.updateText(mid, `⏳ 执行中…\n🔧 调用工具：\`${event.tool}\``);
-    }
+    this.pushTaskStatus(chatId, mid);
+  }
+
+  /** 把当前任务状态渲染到进度消息（节流，避免触发飞书更新频控）。 */
+  private pushTaskStatus(chatId: string, mid: string, force = false): void {
+    const st = this.taskStatus.get(chatId);
+    if (!st) return;
+    const now = Date.now();
+    if (!force && now - st.lastPush < PROGRESS_INTERVAL) return;
+    st.lastPush = now;
+    const lines = ['⏳ Kimi Code 执行中…'];
+    if (st.text) lines.push(`💬 ${truncate(st.text, 300)}`);
+    if (st.tool) lines.push(`🔧 调用工具：\`${st.tool}\``);
+    void this.channel.updateText(mid, lines.join('\n'));
   }
 
   async onTaskDone(chatId: string, task: ChatTask, exitCode: number | null, stderrTail: string): Promise<void> {
+    // 占位消息可能在任务结束后才送达，送达后清掉映射避免下个任务复用旧消息
+    const pend = this.taskMsgPending.get(chatId);
+    if (pend) void pend.finally(() => this.taskMessages.delete(chatId));
+    this.taskMsgPending.delete(chatId);
+    this.taskStatus.delete(chatId);
     this.taskMessages.delete(chatId);
     let result = task.textParts.join('').trim();
     if (!result) result = task.rawTail.join('\n').trim();
@@ -330,14 +564,28 @@ export class Bridge {
   }
 
   // ---------------- 卡片回调 ----------------
-  onCardAction(value: Record<string, unknown>, operator: string): void {
-    if (value.kcf !== 'approval') return;
+  /**
+   * 返回结果卡片 JSON（或 null）：卡片更新内联在回调响应里返回，
+   * 飞书才会立即在点击者的所有设备上同步更新卡片（PATCH API 不保证跨端同步）。
+   */
+  onCardAction(value: Record<string, unknown>, operator: string): Record<string, unknown> | null {
+    const kind = String(value.kcf ?? '');
+    if (kind !== 'approval' && kind !== 'auq') return null;
     if (!this.cfg.allowedUserIds.includes(operator)) {
       console.warn(`[bridge] 非白名单用户 ${operator} 尝试操作审批卡片`);
-      return;
+      return null;
     }
-    const ap = this.approvals.decide(String(value.req_id ?? ''), String(value.d ?? '') as 'allow' | 'deny' | 'allow_session', operator);
-    if (!ap) console.info(`[bridge] 审批 ${value.req_id} 已处理或不存在（可能超时/重复点击）`);
+    if (kind === 'auq') {
+      void this.handleAuqClick(value, operator);
+      return null;
+    }
+    const decision = String(value.d ?? '') as 'allow' | 'deny' | 'allow_session';
+    const ap = this.approvals.decide(String(value.req_id ?? ''), decision, operator);
+    if (!ap) {
+      console.info(`[bridge] 审批 ${value.req_id} 已处理或不存在（可能超时/重复点击）`);
+      return null;
+    }
+    return this.approvalResultCard(ap, decidedTextFor(decision) ?? '❌ 已拒绝', operator);
   }
 
   // ---------------- 路由 ----------------

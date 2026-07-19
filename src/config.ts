@@ -12,8 +12,11 @@ export const DEFAULT_CONFIG_PATH = path.join(DEFAULT_CONFIG_DIR, 'config.toml');
 
 /** 只读类工具默认自动放行（不推审批卡片），避免刷屏。 */
 export const DEFAULT_AUTO_ALLOW_TOOLS = [
-  'ReadFile', 'Read', 'Grep', 'Glob', 'ListDir', 'SearchFile', 'Think',
-  'FetchURL', 'WebSearch', 'TodoWrite', 'TaskList', 'TaskGet',
+  // 真实 Kimi Code CLI 只读工具
+  'Read', 'Grep', 'Glob', 'ReadMediaFile', 'TodoList', 'TaskList', 'TaskOutput',
+  'WebSearch', 'FetchURL', 'CronList', 'GetGoal',
+  // 兼容旧命名（Python 版协议）
+  'ReadFile', 'ListDir', 'SearchFile', 'Think', 'TaskGet', 'TodoWrite',
 ];
 
 /** 命中这些正则的工具参数，不问直接拒绝（在审批卡片之前生效）。 */
@@ -47,6 +50,14 @@ export interface Config {
   progressEnabled: boolean;
   /** 终端里手动跑的 kimi 会话也推送进度/审批 */
   forwardTerminalSessions: boolean;
+  /** 本地 Web Dashboard（实时终端输出） */
+  dashboardEnabled: boolean;
+  dashboardHost: string;
+  dashboardPort: number;
+  /** dashboard 访问 token；空 = 启动时随机生成并打印在终端 */
+  dashboardToken: string;
+  /** dashboard 的公网地址（转发后填写，如 https://dash.example.com）；审批卡片附带「查看实时输出」链接 */
+  dashboardPublicUrl: string;
 }
 
 export function defaultConfig(): Config {
@@ -67,6 +78,11 @@ export function defaultConfig(): Config {
     taskTimeout: 7200,
     progressEnabled: true,
     forwardTerminalSessions: true,
+    dashboardEnabled: true,
+    dashboardHost: '127.0.0.1',
+    dashboardPort: 17772,
+    dashboardToken: '',
+    dashboardPublicUrl: '',
   };
 }
 
@@ -114,6 +130,13 @@ task_timeout = 7200
 [progress]
 progress_enabled = true
 forward_terminal_sessions = true   # 终端里手动启动的 kimi 会话也推送到飞书
+
+[dashboard]
+dashboard_enabled = true           # 本地 WebUI 实时展示 kimi 终端输出
+dashboard_host = "127.0.0.1"       # 要转发公网（飞书网页应用）需显式改 "0.0.0.0"
+dashboard_port = 17772
+dashboard_token = ""               # 空 = 每次启动随机生成并打印在终端
+dashboard_public_url = ""          # 转发后的公网地址（如 https://dash.example.com）；审批卡片附「查看实时输出」链接
 `;
 }
 
@@ -135,6 +158,11 @@ const KEY_MAP: Record<string, keyof Config> = {
   task_timeout: 'taskTimeout',
   progress_enabled: 'progressEnabled',
   forward_terminal_sessions: 'forwardTerminalSessions',
+  dashboard_enabled: 'dashboardEnabled',
+  dashboard_host: 'dashboardHost',
+  dashboard_port: 'dashboardPort',
+  dashboard_token: 'dashboardToken',
+  dashboard_public_url: 'dashboardPublicUrl',
 };
 
 export function loadConfig(configPath?: string): Config {
@@ -170,6 +198,7 @@ export function loadConfig(configPath?: string): Config {
   if (process.env.KCF_WORK_DIR) cfg.workDir = process.env.KCF_WORK_DIR;
   if (process.env.KCF_BRIDGE_PORT) cfg.bridgePort = Number(process.env.KCF_BRIDGE_PORT);
   if (process.env.KCF_KIMI_BIN) cfg.kimiBin = process.env.KCF_KIMI_BIN;
+  if (process.env.KCF_DASHBOARD_PUBLIC_URL) cfg.dashboardPublicUrl = process.env.KCF_DASHBOARD_PUBLIC_URL;
 
   return cfg;
 }

@@ -26,7 +26,15 @@ function* iterTextBlocks(obj: unknown): Generator<string> {
   }
 }
 
-function looksLikeToolEvent(obj: Record<string, unknown>): { kind: StreamEvent['kind']; summary: string } | null {
+function looksLikeToolEvent(obj: Record<string, unknown>): { kind: StreamEvent['kind']; summary: string; text?: string } | null {
+  // 真实 stream-json（OpenAI 风格）：role=tool 的行为工具返回，content 是工具输出
+  if (String(obj.role ?? '') === 'tool') {
+    return {
+      kind: 'tool_result',
+      summary: String(obj.name ?? obj.tool_name ?? 'tool'),
+      text: typeof obj.content === 'string' ? obj.content : undefined,
+    };
+  }
   const t = String(obj.type ?? obj.event ?? '');
   const name = obj.tool_name ?? obj.name ?? '';
   if (t.includes('tool') && name) {
@@ -35,11 +43,16 @@ function looksLikeToolEvent(obj: Record<string, unknown>): { kind: StreamEvent['
     }
     return { kind: 'tool_call', summary: String(name) };
   }
+  // role=assistant 且带 tool_calls：工具调用；content 里的说明文本一并保留
   if (Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0) {
     const names = (obj.tool_calls as Array<Record<string, unknown>>)
       .map((tc) => String((tc.function as Record<string, unknown>)?.name ?? tc.name ?? '?'))
       .join(', ');
-    return { kind: 'tool_call', summary: names || '?' };
+    return {
+      kind: 'tool_call',
+      summary: names || '?',
+      text: typeof obj.content === 'string' && obj.content.trim() ? obj.content : undefined,
+    };
   }
   return null;
 }
@@ -58,7 +71,7 @@ export function parseLine(line: string): StreamEvent | null {
   if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
     const rec = obj as Record<string, unknown>;
     const toolEv = looksLikeToolEvent(rec);
-    if (toolEv) return { kind: toolEv.kind as StreamEvent['kind'], tool: toolEv.summary };
+    if (toolEv) return { kind: toolEv.kind as StreamEvent['kind'], tool: toolEv.summary, text: toolEv.text };
     const texts = [...iterTextBlocks(rec)].filter((t) => t.trim());
     if (texts.length) return { kind: 'text', text: texts.join('') };
     if (['done', 'result', 'finished'].includes(String(rec.type))) return { kind: 'done' };

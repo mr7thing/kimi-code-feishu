@@ -1,8 +1,6 @@
-# kimi-code-feishu (TypeScript)
+# kimi-code-feishu
 
 让 **Kimi Code CLI** 连上飞书机器人：在任何地方用手机给 Kimi Code 派任务、看实时进度、批准/拒绝权限请求。
-
-这是 [kimi-code-feishu](https://github.com/) 的 TypeScript/npm 实现，与 Python 版**协议和配置完全兼容**（同一份 `~/.kimi-code-feishu/config.toml`、同一组 hook HTTP 接口），两版可互换使用。
 
 ```
 ┌─────────────┐   飞书长连接(WebSocket)   ┌──────────────────────────────┐   stdin/exit code   ┌─────────────┐
@@ -91,14 +89,17 @@ command = " /usr/bin/node /path/to/dist/hook.js pre_tool_use"
 timeout = 180
 ```
 
-> 重启正在运行的 kimi 会话后生效；CLI 内 `/hooks` 可确认。TS 版不需要 PYTHONPATH，hook 用绝对路径直接调用。
+> 重启正在运行的 kimi 会话后生效；CLI 内 `/hooks` 可确认。hook 用绝对路径直接调用。
 
-后台常驻：
+后台常驻（推荐 systemd 用户服务，崩溃自动重启、开机自启）：
 
 ```bash
-nohup kimi-code-feishu run > ~/.kimi-code-feishu/bridge.log 2>&1 &
-# 或 pm2 / systemd，任选
+sh deploy/install-service.sh     # 渲染并启用 ~/.config/systemd/user/kimi-code-feishu.service
+journalctl --user -u kimi-code-feishu -f   # 看日志
+# 或简单方式：nohup kimi-code-feishu run > ~/.kimi-code-feishu/bridge.log 2>&1 &
 ```
+
+> 桥在线很重要：fail-closed 设计下桥掉线 = 需审批操作全部默认拒绝。桥每次启动会往最近活跃的聊天发一条「✅ 桥已上线」（附 Dashboard 地址），出门在外能确认它活着。
 
 ## 四、使用方法
 
@@ -125,36 +126,60 @@ nohup kimi-code-feishu run > ~/.kimi-code-feishu/bridge.log 2>&1 &
 - **✅ 批准**：放行这一次；**🔁 本会话允许**：同会话同类工具自动放行；**❌ 拒绝**：阻断并把原因反馈给模型
 - 超时未点（默认 150s）按 `on_timeout` 处理，默认拒绝
 - 不弹卡片的情况：只读工具（`auto_allow_tools`）直接放行；命中 `auto_deny_patterns`（如 `rm -rf /`）直接拒绝
+- 配置了 `dashboard_public_url` 后，卡片底部附「📊 查看实时输出」链接，点开看清现场再决定
+
+### 提问卡片（飞书答题）
+
+模型调用 `AskUserQuestion` 等你回答时，问题和选项会直接渲染成飞书按钮卡片：
+
+- 单选题点选项即答；多选题可多点后点「✔️ 确认本题」；多题卡片集齐所有答案后自动提交
+- 「🚫 拒绝回答」让模型别再问、自行决定；自定义答案请先拒绝，再直接在聊天里把答案发给它
+- 原理：hook 协议无法把输入回传给工具，作答是以 `deny + 理由` 形式返回的（理由进上下文，模型读到你的答案继续）——所以终端里看到这次工具调用被"拒绝"是**预期行为**
 
 ### 监控终端会话
 
 终端里跑 `kimi --yolo`，审批闸门即完全交给飞书卡片，出门在外也能远程点头。
 
-## 五、安全设计
+## 五、Dashboard（本地 WebUI）
+
+`run` 启动桥时会同时启动一个本地 Web Dashboard（默认 `127.0.0.1:17772`），实时展示所有任务的 **kimi 终端原始输出**（stdout / stderr / 任务启停 / 审批动作），浏览器打开启动日志里打印的带 token 地址即可：
+
+```
+📊 Dashboard: http://127.0.0.1:17772/?token=xxxxxxxx
+```
+
+- 按聊天过滤、自动滚动；新打开的页面会回放最近 500 条事件
+- 推送走 SSE，token 认证（`dashboard_token` 配置为空则每次启动随机生成）
+- 配置见 `[dashboard]` 节：`dashboard_enabled` / `dashboard_host` / `dashboard_port` / `dashboard_token`
+
+**转发为飞书网页应用（cloudflared）**：无需改配置、无需公网 IP，一条命令同时拉起桥和隧道：
+
+```bash
+bash deploy/run-with-tunnel.sh
+# 输出：🌐 Dashboard 公网地址：https://xxxx.trycloudflare.com
+```
+
+隧道域名会自动注入 `KCF_DASHBOARD_PUBLIC_URL`，审批/提问卡片底部的「📊 查看实时输出」在手机上（蜂窝网络）也能打开；飞书开放平台 → 应用功能 → **网页应用** 里填同一个带 token 的 URL 即可内嵌仪表盘。
+
+> quick tunnel 的域名**每次启动都会变**，重启后飞书网页应用后台要同步改地址；想固定域名，用 Cloudflare 账号建 named tunnel 并把 `dashboard_public_url` 写进配置。
+
+> ⚠️ 终端输出可能包含敏感信息，**token 即密码**：转发务必走 HTTPS，且不要把带 token 的 URL 发给不信任的人。
+
+## 六、安全设计
 
 - **白名单**：仅 `allowed_user_ids` 中的 open_id 能发指令、点卡片；其他人点击被忽略并记日志
 - **不出本机**：hook 服务只听 `127.0.0.1`；飞书走长连接，无入站端口
+- **Dashboard**：默认只听 `127.0.0.1` + token 认证；转发公网需自行承担暴露风险
 - **fail-closed**：桥掉线时默认**拒绝**需审批操作（`fail_closed = false` 可改回官方 fail-open）
 - **紧急旁路**：`KCF_DISABLED=1` 后所有 hook 直接放行
 - Kimi hooks 是 Beta 且 fail-open 设计，不要当作唯一安全防线
-
-## 六、与 Python 版的关系
-
-| | Python 版 | TS 版（本项目） |
-|---|---|---|
-| 分发 | pip / 源码 | **npm（`npm i -g`）** |
-| 飞书 SDK | `lark-oapi` | 官方 `@larksuiteoapi/node-sdk`（WSClient + card.action.trigger） |
-| 审批等待 | threading.Event | pending Promise |
-| hook 入口 | `python -m kimi_code_feishu.hook` | `node dist/hook.js`（绝对路径，免 PYTHONPATH） |
-| 配置文件 | 同一份，完全兼容 | 同一份，完全兼容 |
-| 自检 | 33 项 | 41 项 |
 
 ## 七、开发与自检
 
 ```bash
 npm install
 npm run build          # tsc → dist/
-node dist/selfcheck.js # 41 项端到端自检（假通道 + 假 kimi，不需要真实飞书）
+node dist/selfcheck.js # 54 项端到端自检（假通道 + 假 kimi，不需要真实飞书）
 npm pack               # 产出可分发的 .tgz（约 20KB）
 ```
 
@@ -170,7 +195,7 @@ npm pack               # 产出可分发的 .tgz（约 20KB）
 SDK 1.71+ 已修复旧版 `reConnect()` 定时器泄漏（上游 #177），`autoReconnect: true` 开箱即用；`feishuChannel.ts` 里留有注释说明。
 
 **Q：Windows？**
-核心逻辑跨平台；hook 命令不含 shell 变量前缀（比 Python 版更友好），但进程组终止在 Windows 上退化为单进程 kill。
+核心逻辑跨平台；hook 命令不含 shell 变量前缀，但进程组终止在 Windows 上退化为单进程 kill。
 
 ## 项目结构
 
@@ -185,11 +210,12 @@ src/
 ├── hook.ts           # Kimi CLI hook 入口（stdin JSON → 桥 → 退出码/结构化输出）
 ├── hookServer.ts     # 127.0.0.1 HTTP 服务
 ├── kimiRunner.ts     # headless 任务运行器（spawn + 进程组管理）
+├── dashboard.ts      # 本地 WebUI（SSE 实时终端输出，token 认证）
 ├── streamParser.ts   # stream-json 容错解析
 ├── approvals.ts      # 待审批注册表（Promise 挂起/唤醒）
 ├── state.ts          # 聊天绑定、会话路由持久化
 ├── installer.ts      # hooks 注入/移除（自动备份）
-└── selfcheck.ts      # 41 项端到端自检
+└── selfcheck.ts      # 54 项端到端自检
 ```
 
 ## License

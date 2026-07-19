@@ -12,6 +12,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import readline from 'node:readline';
 import type { Config } from './config.js';
+import type { DashKind } from './dashboard.js';
 import type { StateStore } from './state.js';
 import { parseLine, type StreamEvent } from './streamParser.js';
 
@@ -30,6 +31,20 @@ export interface RunnerCallbacks {
   onTaskDone(chatId: string, task: ChatTask, exitCode: number | null, stderrTail: string): void;
 }
 
+/** 原始输出监听（dashboard 用）：每一行 stdout、stderr 块、生命周期事件，原文转发。 */
+export type OutputListener = (chatId: string, kind: DashKind, text: string) => void;
+
+const trunc = (s: string, n: number) => (s.length <= n ? s : s.slice(0, n - 1) + '…');
+
+/** stream-json 行 → dashboard 上的一行紧凑可读摘要。 */
+export function compactStreamLine(raw: string, ev: StreamEvent | null): string {
+  if (!ev) return trunc(raw, 200); // 未识别的协议行
+  if (ev.kind === 'tool_call') return `🔧 ${ev.tool}${ev.text ? '｜' + trunc(ev.text.replace(/\s+/g, ' '), 120) : ''}`;
+  if (ev.kind === 'tool_result') return `📎 ${trunc((ev.text ?? '').replace(/\s+/g, ' '), 200)}`;
+  if (ev.kind === 'done') return '✅ 流结束';
+  return trunc(ev.text ?? raw, 400);
+}
+
 export class KimiRunner {
   private active = new Map<string, ChatTask>();
 
@@ -37,6 +52,7 @@ export class KimiRunner {
     private cfg: Config,
     private state: StateStore,
     private cb: RunnerCallbacks,
+    private onOutput?: OutputListener,
   ) {}
 
   isBusy(chatId: string): boolean {
@@ -73,15 +89,19 @@ export class KimiRunner {
     };
     this.active.set(chatId, task);
     this.state.setHasSession(chatId, true);
+    this.onOutput?.(chatId, 'lifecycle', `▶ 任务启动：${prompt.slice(0, 200)}`);
 
     let stderrTail = '';
     proc.stderr?.on('data', (d: Buffer) => {
-      stderrTail = (stderrTail + d.toString('utf-8')).slice(-2000);
+      const text = d.toString('utf-8');
+      stderrTail = (stderrTail + text).slice(-2000);
+      this.onOutput?.(chatId, 'stderr', trunc(text.replace(/\n+$/, ''), 300));
     });
 
     const rl = readline.createInterface({ input: proc.stdout! });
     rl.on('line', (line) => {
       const ev = parseLine(line);
+      this.onOutput?.(chatId, 'stdout', compactStreamLine(line, ev));
       if (!ev) return;
       if (ev.kind === 'text') task.textParts.push(ev.text ?? '');
       else if (ev.kind === 'tool_call' || ev.kind === 'tool_result') task.toolLines.push(`${ev.kind}:${ev.tool}`);
@@ -106,12 +126,14 @@ export class KimiRunner {
       // spawn 失败（如 ENOENT）
       clearTimeout(watchdog);
       this.active.delete(chatId);
+      this.onOutput?.(chatId, 'lifecycle', `✖ 进程错误：${String(err)}`);
       this.cb.onTaskDone(chatId, task, 127, String(err));
     });
 
     proc.on('close', (code) => {
       clearTimeout(watchdog);
       this.active.delete(chatId);
+      this.onOutput?.(chatId, 'lifecycle', `■ 任务结束，exit=${code ?? 'null'}`);
       try {
         this.cb.onTaskDone(chatId, task, code, stderrTail);
       } catch (err) {
@@ -135,6 +157,7 @@ export class KimiRunner {
 
   private kill(task: ChatTask): void {
     const pid = task.proc.pid;
+    this.onOutput?.(task.chatId, 'lifecycle', '⏹ 已发送终止信号');
     try {
       if (process.platform !== 'win32' && pid) {
         process.kill(-pid, 'SIGTERM'); // 杀整个进程组

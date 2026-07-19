@@ -16,4 +16,5 @@ export interface Channel {
 }
 
 export type MessageHandler = (chatId: string, openId: string, text: string) => void;
-export type CardActionHandler = (value: Record<string, unknown>, operatorOpenId: string) => void;
+/** 返回结果卡片 JSON 时会内联进回调响应（全端立即同步），null 则只弹 toast。 */
+export type CardActionHandler = (value: Record<string, unknown>, operatorOpenId: string) => Record<string, unknown> | null;

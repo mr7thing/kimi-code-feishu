@@ -10,12 +10,14 @@
  *   kimi-code-feishu doctor      环境自检
  */
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import net from 'node:net';
 import * as readline from 'node:readline/promises';
 import QRCode from 'qrcode';
 import { pollAppRegistration, RegistrationError, requestAppRegistration } from './appRegistration.js';
 import { Bridge } from './bridge.js';
 import { loadConfig, saveConfig, saveExampleConfig } from './config.js';
+import { Dashboard, serveDashboard, type DashboardServer } from './dashboard.js';
 import { FeishuChannel } from './feishuChannel.js';
 import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
@@ -184,7 +186,22 @@ async function cmdRun(args: string[]): Promise<number> {
   }
 
   const state = new StateStore();
-  const bridge = new Bridge(cfg, state);
+
+  // Dashboard：本地 WebUI，实时展示 kimi 终端输出（token 为空则每次启动随机生成）
+  let dashboard: Dashboard | undefined;
+  let dashServer: DashboardServer | undefined;
+  if (cfg.dashboardEnabled) {
+    dashboard = new Dashboard();
+    const token = cfg.dashboardToken || crypto.randomBytes(8).toString('hex');
+    cfg.dashboardToken = token; // 回填，审批卡片的「查看实时输出」链接用同一个 token
+    dashServer = await serveDashboard(dashboard, cfg.dashboardHost, cfg.dashboardPort, token, {
+      idleTimeoutMs: 600_000,
+      onClose: (reason) => console.log(`[dashboard] 已关闭：${reason}`),
+    });
+    console.log(`📊 Dashboard: http://${cfg.dashboardHost}:${cfg.dashboardPort}/?token=${token}`);
+  }
+
+  const bridge = new Bridge(cfg, state, undefined, dashboard);
   const channel = new FeishuChannel(
     cfg.appId, cfg.appSecret,
     (chatId, openId, text) => void bridge.onFeishuMessage(chatId, openId, text),
@@ -194,6 +211,15 @@ async function cmdRun(args: string[]): Promise<number> {
 
   const hookServer = await serveHooks(bridge, cfg.bridgeHost, cfg.bridgePort);
   await channel.start();
+
+  // 上线通知：发到最近活跃的聊天，出门在外能确认桥在线
+  const notifyChat = state.defaultNotifyChat();
+  if (notifyChat) {
+    const dashUrl = dashServer
+      ? `${cfg.dashboardPublicUrl || `http://${cfg.dashboardHost}:${cfg.dashboardPort}`}?token=${cfg.dashboardToken}`
+      : '';
+    void channel.sendText(notifyChat, `✅ 桥已上线${dashUrl ? `\n📊 Dashboard: ${dashUrl}` : ''}`);
+  }
 
   console.log('kimi-code-feishu 已启动，按 Ctrl+C 退出');
 
@@ -205,6 +231,7 @@ async function cmdRun(args: string[]): Promise<number> {
   bridge.runner.stopAll();
   await channel.close();
   await hookServer.close();
+  await dashServer?.close();
   return 0;
 }
 
