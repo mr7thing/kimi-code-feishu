@@ -22,12 +22,6 @@ export interface Approval {
   result: ApprovalResult | null;
   resolve: (r: ApprovalResult) => void;
   promise: Promise<ApprovalResult>;
-  /** AskUserQuestion 答题状态：questions 已拍平为选项数组；sel 为多选暂存，answers 为定稿答案 */
-  auq?: {
-    questions: Array<{ question: string; header?: string; multi: boolean; options: string[] }>;
-    sel: Array<Set<string>>;
-    answers: Array<string[] | null>;
-  };
 }
 
 export class ApprovalManager {

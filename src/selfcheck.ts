@@ -297,68 +297,7 @@ async function main(): Promise<void> {
     await sleep(300);
     check('端到端: Interrupt 事件通知到飞书', channel.texts().some((t) => t.includes('中断')));
 
-    // 5.9 飞书答题：AskUserQuestion 选项卡片
-    const auqButtons = (card: Record<string, unknown>): Array<Record<string, unknown>> => {
-      const out: Array<Record<string, unknown>> = [];
-      for (const el of (card.elements ?? []) as Array<Record<string, unknown>>) {
-        if (el.tag !== 'action') continue;
-        for (const a of (el.actions ?? []) as Array<Record<string, unknown>>) {
-          if ((a.value as Record<string, unknown>)?.kcf === 'auq') out.push(a);
-        }
-      }
-      return out;
-    };
-    const auqCards = () => channel.cards().filter((c) => auqButtons(c).length > 0);
-    const clickAuq = async (match: (v: Record<string, unknown>) => boolean, cardIdx: number) => {
-      for (let i = 0; i < 50; i++) {
-        const cards = auqCards();
-        if (cards.length > cardIdx) {
-          const btn = auqButtons(cards[cardIdx]).find((b) => match(b.value as Record<string, unknown>));
-          if (btn) {
-            await sleep(50);
-            bridge.onCardAction(btn.value as Record<string, unknown>, 'ou_boss');
-            return true;
-          }
-        }
-        await sleep(100);
-      }
-      return false;
-    };
-
-    // 单题：点击选项 → deny + 答案理由
-    let answerer = clickAuq((v) => v.a === '方案B', 0);
-    r = await runHook(cfgPath, 'pre_tool_use', {
-      session_id: 's1', cwd: tmp, tool_name: 'AskUserQuestion',
-      tool_input: { questions: [{ question: '用哪个方案？', options: [{ label: '方案A' }, { label: '方案B' }] }] },
-    });
-    check('答题: 单题作答以 deny+答案理由 回传', (await answerer) && isDeny(r.stdout) && r.stdout.includes('方案B'));
-
-    // 拒绝回答
-    answerer = clickAuq((v) => v.d === 'deny', 1);
-    r = await runHook(cfgPath, 'pre_tool_use', {
-      session_id: 's1', cwd: tmp, tool_name: 'AskUserQuestion',
-      tool_input: { questions: [{ question: '继续吗？', options: [{ label: '是' }, { label: '否' }] }] },
-    });
-    check('答题: 拒绝回答输出 deny', (await answerer) && isDeny(r.stdout) && r.stdout.includes('拒绝回答'));
-
-    // 多题：两题各选一个 → 理由含两个答案
-    const twoQ = (async () => {
-      const ok1 = await clickAuq((v) => v.q === 0 && v.a === '甲', 2);
-      const ok2 = await clickAuq((v) => v.q === 1 && v.a === '丁', 2);
-      return ok1 && ok2;
-    })();
-    r = await runHook(cfgPath, 'pre_tool_use', {
-      session_id: 's1', cwd: tmp, tool_name: 'AskUserQuestion',
-      tool_input: {
-        questions: [
-          { question: '第一题？', options: [{ label: '甲' }, { label: '乙' }] },
-          { question: '第二题？', options: [{ label: '丙' }, { label: '丁' }] },
-        ],
-      },
-    });
-    check('答题: 多题集齐答案后回传', (await twoQ) && isDeny(r.stdout) && r.stdout.includes('甲') && r.stdout.includes('丁'));
-
-    // 5.10 配置 dashboard_public_url 后审批卡片带链接
+    // 5.9 配置 dashboard_public_url 后审批卡片带链接
     cfg.dashboardPublicUrl = 'https://dash.example.com';
     cfg.dashboardToken = 'tok-xyz';
     const linkApprover = (async () => {

@@ -47,29 +47,6 @@ function decidedTextFor(decision: string): string | null {
 
 type HookResponse = { decision: string; reason?: string };
 
-type AuqQuestion = { question: string; header?: string; multi: boolean; options: string[] };
-
-/** 解析 AskUserQuestion 的 tool_input；解析不出有效问题返回空数组（调用方回退普通审批）。 */
-export function parseAuqQuestions(ti: unknown): AuqQuestion[] {
-  if (!ti || typeof ti !== 'object' || Array.isArray(ti)) return [];
-  const qs = (ti as Record<string, unknown>).questions;
-  if (!Array.isArray(qs)) return [];
-  const out: AuqQuestion[] = [];
-  for (const q of qs.slice(0, 4)) {
-    if (!q || typeof q !== 'object') continue;
-    const rec = q as Record<string, unknown>;
-    const question = String(rec.question ?? '').trim();
-    const options = (Array.isArray(rec.options) ? rec.options : [])
-      .map((o) => String((o as Record<string, unknown>)?.label ?? '').trim())
-      .filter(Boolean)
-      .slice(0, 4);
-    if (!question || options.length < 2) continue;
-    const header = String(rec.header ?? '').trim();
-    out.push({ question, header: header || undefined, multi: rec.multi_select === true, options });
-  }
-  return out;
-}
-
 interface ProgressState {
   messageId?: string;
   lines: string[];
@@ -114,12 +91,6 @@ export class Bridge {
       } catch {
         /* 忽略坏正则 */
       }
-    }
-
-    // 2.5) AskUserQuestion：把问题渲染成飞书选项卡片，作答后以 deny+理由 回传答案
-    if (tool === 'AskUserQuestion') {
-      const r = await this.handleAskUserQuestion(payload);
-      if (r) return r; // null = 问题格式无法解析，回退为普通审批卡
     }
 
     // 3) 用户之前点过"本会话允许"
@@ -174,146 +145,6 @@ export class Bridge {
   private timeoutDecision(reason: string): HookResponse {
     if (this.cfg.onTimeout === 'allow') return { decision: 'allow', reason };
     return { decision: 'deny', reason: `飞书审批超时：${reason}` };
-  }
-
-  // ================================================================
-  // AskUserQuestion：飞书答题
-  // hook 协议无法把用户输入回传给工具，做法是：选项做成飞书按钮，
-  // 集齐答案后 hook 返回 deny + 理由（理由进上下文，模型拿答案继续）。
-  // ================================================================
-  private async handleAskUserQuestion(payload: Record<string, unknown>): Promise<HookResponse | null> {
-    const questions = parseAuqQuestions(payload.tool_input);
-    if (!questions.length) return null;
-
-    const chatId = this.routeChat(payload);
-    if (!chatId) return this.timeoutDecision('尚未有任何飞书聊天与桥绑定（先给机器人发条消息）');
-
-    const ap = this.approvals.create(payload);
-    ap.chatId = chatId;
-    ap.auq = { questions, sel: questions.map(() => new Set<string>()), answers: questions.map(() => null) };
-    try {
-      ap.messageId = await this.channel.sendCard(chatId, this.auqCard(ap));
-    } catch (err) {
-      console.error('[bridge] 发送提问卡片失败:', err);
-    }
-    if (!ap.messageId) return this.timeoutDecision('提问卡片发送失败');
-    this.dashboard?.publish(chatId, 'progress', `❓ 模型提问：${truncate(questions.map((q) => q.question).join('；'), 200)}`);
-
-    const result = await this.approvals.wait(ap, this.cfg.approvalTimeout * 1000);
-    if (result.decision === null) {
-      await this.updateCardQuiet(ap, this.auqResultCard(ap, '⏰ 超时未作答'));
-      return this.timeoutDecision(`${this.cfg.approvalTimeout}s 未作答`);
-    }
-    if (result.decision === 'deny') {
-      await this.updateCardQuiet(ap, this.auqResultCard(ap, '🚫 用户拒绝回答'));
-      return { decision: 'deny', reason: '用户拒绝回答该提问。请不要再问同一问题，自行决定或换个方案继续。' };
-    }
-    const qa = questions.map((q, i) => `Q${i + 1}「${q.question}」答：${(ap.auq!.answers[i] ?? []).join('、')}`).join('\n');
-    await this.updateCardQuiet(ap, this.auqResultCard(ap, '✅ 已作答', qa));
-    this.dashboard?.publish(chatId, 'progress', `✅ 飞书作答：${truncate(qa, 200)}`);
-    return {
-      decision: 'deny',
-      reason: `注意：该提问已由用户通过飞书远程作答（本次工具调用被拒绝是预期行为，并非用户不愿回答）。\n${qa}\n请以上述回答为准继续工作，不要再次询问同一问题。`,
-    };
-  }
-
-  private async updateCardQuiet(ap: Approval, card: Record<string, unknown>): Promise<void> {
-    if (!ap.messageId) return;
-    try {
-      await this.channel.updateCard(ap.messageId, card);
-    } catch (err) {
-      console.error('[bridge] 更新卡片失败:', err);
-    }
-  }
-
-  private async handleAuqClick(value: Record<string, unknown>, operator: string): Promise<void> {
-    const reqId = String(value.req_id ?? '');
-    const ap = this.approvals.get(reqId);
-    if (!ap?.auq) {
-      console.info(`[bridge] 答题 ${reqId} 已处理或不存在（可能超时/重复点击）`);
-      return;
-    }
-    if (String(value.d ?? '') === 'deny') {
-      this.approvals.decide(reqId, 'deny', operator);
-      return;
-    }
-    const q = Number(value.q);
-    const a = String(value.a ?? '');
-    const auq = ap.auq;
-    if (!Number.isInteger(q) || q < 0 || q >= auq.questions.length || auq.answers[q]) return;
-    const sel = auq.sel[q];
-    if (a === '__confirm__') {
-      if (!sel.size) return;
-      auq.answers[q] = [...sel];
-    } else if (auq.questions[q].multi) {
-      if (sel.has(a)) sel.delete(a);
-      else sel.add(a);
-    } else {
-      auq.answers[q] = [a];
-    }
-    // 全部题答完 → 结束挂起；否则更新卡片显示已选状态
-    if (auq.answers.every((ans) => ans && ans.length > 0)) {
-      this.approvals.decide(reqId, 'allow', operator);
-      return;
-    }
-    if (ap.messageId) {
-      try {
-        await this.channel.updateCard(ap.messageId, this.auqCard(ap));
-      } catch (err) {
-        console.error('[bridge] 更新答题卡片失败:', err);
-      }
-    }
-  }
-
-  // ---------------- 提问卡片 ----------------
-  private auqCard(ap: Approval): Record<string, unknown> {
-    const auq = ap.auq!;
-    const elements: unknown[] = [];
-    auq.questions.forEach((q, qi) => {
-      const head = `**Q${qi + 1}${q.multi ? '（多选，选完点确认）' : ''}：${truncate(q.question, 400)}**`;
-      elements.push({ tag: 'div', text: { tag: 'lark_md', content: q.header ? `${head}\n${q.header}` : head } });
-      const answered = auq.answers[qi];
-      if (answered) {
-        elements.push({ tag: 'div', text: { tag: 'lark_md', content: `✅ 已选：**${answered.join('、')}**` } });
-        return;
-      }
-      const btns = q.options.map((opt) => ({
-        tag: 'button',
-        text: { tag: 'plain_text', content: truncate(auq.sel[qi].has(opt) ? `✅ ${opt}` : opt, 30) },
-        type: auq.sel[qi].has(opt) ? 'primary' : 'default',
-        value: { kcf: 'auq', req_id: ap.reqId, q: qi, a: opt },
-      }));
-      if (q.multi) {
-        btns.push({
-          tag: 'button',
-          text: { tag: 'plain_text', content: '✔️ 确认本题' },
-          type: 'primary',
-          value: { kcf: 'auq', req_id: ap.reqId, q: qi, a: '__confirm__' },
-        });
-      }
-      elements.push({ tag: 'action', actions: btns });
-    });
-    elements.push({
-      tag: 'action',
-      actions: [{ tag: 'button', text: { tag: 'plain_text', content: '🚫 拒绝回答' }, type: 'danger', value: { kcf: 'auq', req_id: ap.reqId, d: 'deny' } }],
-    });
-    const timeoutText = this.cfg.onTimeout === 'deny' ? '拒绝（模型自行决定）' : '放行到终端作答';
-    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: `${this.cfg.approvalTimeout} 秒未作答将${timeoutText}；自定义答案请点「拒绝回答」后直接在聊天里补充` }] });
-    elements.push(...this.dashNote());
-    return {
-      config: { wide_screen_mode: true, update_multi: true },
-      header: { template: 'blue', title: { tag: 'plain_text', content: '❓ Kimi Code 等待你的回答' } },
-      elements,
-    };
-  }
-
-  private auqResultCard(ap: Approval, decidedText: string, detail = ''): Record<string, unknown> {
-    const ok = decidedText.startsWith('✅');
-    return {
-      config: { wide_screen_mode: true, update_multi: true },
-      header: { template: ok ? 'green' : 'red', title: { tag: 'plain_text', content: `❓ 提问 ${decidedText}` } },
-      elements: [{ tag: 'div', text: { tag: 'lark_md', content: truncate(detail || decidedText, 1000) } }],
-    };
   }
 
   /** 配置了 dashboard_public_url 时，卡片底部附「查看实时输出」链接。 */
@@ -569,14 +400,9 @@ export class Bridge {
    * 飞书才会立即在点击者的所有设备上同步更新卡片（PATCH API 不保证跨端同步）。
    */
   onCardAction(value: Record<string, unknown>, operator: string): Record<string, unknown> | null {
-    const kind = String(value.kcf ?? '');
-    if (kind !== 'approval' && kind !== 'auq') return null;
+    if (String(value.kcf ?? '') !== 'approval') return null;
     if (!this.cfg.allowedUserIds.includes(operator)) {
       console.warn(`[bridge] 非白名单用户 ${operator} 尝试操作审批卡片`);
-      return null;
-    }
-    if (kind === 'auq') {
-      void this.handleAuqClick(value, operator);
       return null;
     }
     const decision = String(value.d ?? '') as 'allow' | 'deny' | 'allow_session';
