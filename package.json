@@ -1,0 +1,31 @@
+{
+  "name": "kimi-code-feishu",
+  "version": "0.1.0",
+  "description": "让 Kimi Code CLI 通过飞书机器人远程通信：派任务、看进度、批权限",
+  "type": "module",
+  "bin": {
+    "kimi-code-feishu": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "!dist/selfcheck.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "selfcheck": "npm run build && node dist/selfcheck.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.71.1",
+    "smol-toml": "^1.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
+  }
+}
