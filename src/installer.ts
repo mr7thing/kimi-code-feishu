@@ -41,15 +41,20 @@ function hookCommand(event: string, cfgPath?: string): string {
   return `${envParts.join(' ')} ${process.execPath} ${hookJsPath()} ${event}`.trim();
 }
 
+/** 嵌入 TOML 基本字符串前转义 \ 和 "，避免生成非法 TOML。 */
+function tomlEscape(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 export function buildBlock(approvalTimeout = 150, cfgPath?: string): string {
   const hookTimeout = Math.min(approvalTimeout + 30, 600);
   const lines: string[] = [BEGIN, '# 由 kimi-code-feishu install 生成；uninstall 可整块移除'];
   lines.push('[[hooks]]', 'event = "PreToolUse"',
-    `command = "${hookCommand('pre_tool_use', cfgPath)}"`,
+    `command = "${tomlEscape(hookCommand('pre_tool_use', cfgPath))}"`,
     `timeout = ${hookTimeout}`, '');
   for (const ev of PROGRESS_EVENTS) {
     lines.push('[[hooks]]', `event = "${ev}"`,
-      `command = "${hookCommand(ev.toLowerCase(), cfgPath)}"`,
+      `command = "${tomlEscape(hookCommand(ev.toLowerCase(), cfgPath))}"`,
       'timeout = 5', '');
   }
   lines.push(END);

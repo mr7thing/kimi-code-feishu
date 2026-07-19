@@ -117,14 +117,14 @@ nohup kimi-code-feishu run > ~/.kimi-code-feishu/bridge.log 2>&1 &
 | 审批等待 | threading.Event | pending Promise |
 | hook 入口 | `python -m kimi_code_feishu.hook` | `node dist/hook.js`（绝对路径，免 PYTHONPATH） |
 | 配置文件 | 同一份，完全兼容 | 同一份，完全兼容 |
-| 自检 | 33 项 | 34 项（多一项 hook 路径断言） |
+| 自检 | 33 项 | 36 项 |
 
 ## 七、开发与自检
 
 ```bash
 npm install
 npm run build          # tsc → dist/
-node dist/selfcheck.js # 34 项端到端自检（假通道 + 假 kimi，不需要真实飞书）
+node dist/selfcheck.js # 36 项端到端自检（假通道 + 假 kimi，不需要真实飞书）
 npm pack               # 产出可分发的 .tgz（约 20KB）
 ```
 
@@ -158,7 +158,7 @@ src/
 ├── approvals.ts      # 待审批注册表（Promise 挂起/唤醒）
 ├── state.ts          # 聊天绑定、会话路由持久化
 ├── installer.ts      # hooks 注入/移除（自动备份）
-└── selfcheck.ts      # 34 项端到端自检
+└── selfcheck.ts      # 36 项端到端自检
 ```
 
 ## License

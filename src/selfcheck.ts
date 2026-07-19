@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { parse as parseToml } from 'smol-toml';
 import { ApprovalManager } from './approvals.js';
 import { Bridge, toolInputSummary } from './bridge.js';
 import { loadConfig } from './config.js';
@@ -150,6 +151,10 @@ async function main(): Promise<void> {
     check('安装器: 写入进度事件', text.includes('event = "PostToolUse"') && text.includes('event = "Stop"'));
     check('安装器: timeout=审批+30', text.includes('timeout = 150'));
     check('安装器: hook 命令指向本包 hook.js', text.includes('hook.js pre_tool_use'));
+    // 回归：写出的必须是合法 TOML，且转义后命令里的 KCF_CONFIG 保持完整
+    const parsed = parseToml(text) as { hooks?: Array<{ command?: string }> };
+    check('安装器: 生成的 TOML 可解析', Array.isArray(parsed.hooks) && parsed.hooks.length === 9);
+    check('安装器: 解析后 KCF_CONFIG 完整', (parsed.hooks?.[0]?.command ?? '').includes('KCF_CONFIG="/tmp/x/config.toml"'));
     let threw = false;
     try { installer.install(kimiCfg); } catch { threw = true; }
     check('安装器: 重复安装报错', threw);
