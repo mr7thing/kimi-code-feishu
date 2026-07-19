@@ -10,10 +10,12 @@ import type { Approval, ApprovalManager as AM } from './approvals.js';
 import { ApprovalManager } from './approvals.js';
 import type { Channel } from './channel.js';
 import type { Config } from './config.js';
-import type { Dashboard } from './dashboard.js';
+import crypto from 'node:crypto';
+import { Dashboard, serveDashboard, type DashboardServer } from './dashboard.js';
 import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
 import type { StreamEvent } from './streamParser.js';
+import { startCloudflaredTunnel, type TunnelHandle } from './tunnel.js';
 
 const MAX_TEXT = 3500;         // 飞书单条文本消息的保守上限
 const PROGRESS_INTERVAL = 1500; // 进度消息最小更新间隔（毫秒）
@@ -62,15 +64,80 @@ export class Bridge {
   private taskMessages = new Map<string, string>();
   private taskMsgPending = new Map<string, Promise<string | undefined>>();
   private taskStatus = new Map<string, { text?: string; tool?: string; lastPush: number }>();
+  /** dashboard 事件总线（始终存在）；HTTP 服务按需开启 */
+  private dashboardBus = new Dashboard();
+  private dashServer?: DashboardServer;
+  private dashToken?: string;
+  private dashPublic?: string;
+  private tunnel?: TunnelHandle;
+  private dashChat?: string;
 
   constructor(
     private cfg: Config,
     private state: StateStore,
     channel?: Channel,
-    private dashboard?: Dashboard,
   ) {
     if (channel) this.channel = channel;
-    this.runner = new KimiRunner(cfg, state, this, (chatId, kind, text) => this.dashboard?.publish(chatId, kind, text));
+    this.runner = new KimiRunner(cfg, state, this, (chatId, kind, text) => this.dashboardBus.publish(chatId, kind, text));
+  }
+
+  // ================================================================
+  // Dashboard 生命周期：飞书 /dashboard 命令按需开启，闲置自动关闭
+  // ================================================================
+  /** 开启 dashboard（幂等，已开则直接返回当前链接）。返回带 token 的完整 URL。 */
+  async openDashboard(chatId: string): Promise<string> {
+    this.dashChat = chatId;
+    if (this.dashServer) return this.dashboardUrl()!;
+
+    const token = crypto.randomBytes(8).toString('hex');
+    this.dashServer = await serveDashboard(this.dashboardBus, this.cfg.dashboardHost, this.cfg.dashboardPort, token, {
+      idlePageMs: this.cfg.dashboardIdleTimeoutPage * 1000,
+      idleNopageMs: this.cfg.dashboardIdleTimeoutNopage * 1000,
+      onClose: (reason) => void this.onDashboardClosed(reason),
+    });
+    this.dashToken = token;
+
+    // 公网地址：优先固定配置（named tunnel），否则临时拉 quick tunnel，失败回退局域网
+    if (this.cfg.dashboardPublicUrl) {
+      this.dashPublic = this.cfg.dashboardPublicUrl.replace(/\/+$/, '');
+    } else {
+      this.tunnel = (await startCloudflaredTunnel(this.cfg.cloudflaredBin, this.cfg.dashboardPort)) ?? undefined;
+      if (!this.tunnel) console.warn('[bridge] cloudflared 不可用，dashboard 只有局域网链接');
+    }
+    return this.dashboardUrl()!;
+  }
+
+  /** 当前 dashboard URL；未开启返回 null。 */
+  dashboardUrl(): string | null {
+    if (!this.dashServer || !this.dashToken) return null;
+    const base = this.dashPublic ?? this.tunnel?.url ?? `http://${this.cfg.dashboardHost}:${this.cfg.dashboardPort}`;
+    return `${base}?token=${this.dashToken}`;
+  }
+
+  /** 主动关闭（/dashboard off）。返回是否真有在跑。 */
+  async closeDashboard(reason: string): Promise<boolean> {
+    if (!this.dashServer) return false;
+    await this.dashServer.close(reason);
+    return true;
+  }
+
+  /** 服务端任何路径关闭后的统一收尾：杀隧道 + 通知开启者。 */
+  private async onDashboardClosed(reason: string): Promise<void> {
+    this.dashServer = undefined;
+    this.dashToken = undefined;
+    this.dashPublic = undefined;
+    if (this.tunnel) {
+      this.tunnel.proc.kill('SIGTERM');
+      this.tunnel = undefined;
+    }
+    const chat = this.dashChat ?? this.state.defaultNotifyChat();
+    if (chat) {
+      try {
+        await this.channel.sendText(chat, `📊 Dashboard 已关闭（${reason}）`);
+      } catch {
+        /* 通知失败不影响关闭 */
+      }
+    }
   }
 
   // ================================================================
@@ -112,7 +179,7 @@ export class Bridge {
       console.error('[bridge] 发送审批卡片失败:', err);
     }
     if (!ap.messageId) return this.timeoutDecision('审批卡片发送失败');
-    this.dashboard?.publish(chatId, 'progress', `🔐 审批请求：${tool} — ${truncate(summary, 200)}`);
+    this.dashboardBus.publish(chatId, 'progress', `🔐 审批请求：${tool} — ${truncate(summary, 200)}`);
 
     const result = await this.approvals.wait(ap, this.cfg.approvalTimeout * 1000);
     return this.resolve(ap, result.decision, result.operator);
@@ -138,7 +205,7 @@ export class Bridge {
         console.error('[bridge] 更新审批卡片失败:', err);
       }
     }
-    if (ap.chatId) this.dashboard?.publish(ap.chatId, 'progress', `${decidedText}：${ap.toolName}${operator ? `（${operator}）` : ''}`);
+    if (ap.chatId) this.dashboardBus.publish(ap.chatId, 'progress', `${decidedText}：${ap.toolName}${operator ? `（${operator}）` : ''}`);
     return resp;
   }
 
@@ -147,12 +214,12 @@ export class Bridge {
     return { decision: 'deny', reason: `飞书审批超时：${reason}` };
   }
 
-  /** 配置了 dashboard_public_url 时，卡片底部附「查看实时输出」链接。 */
+  /** dashboard 开启中 → 卡片底部附当前链接；未开启 → 提示 /dashboard 命令。 */
   private dashNote(): unknown[] {
-    if (!this.cfg.dashboardPublicUrl) return [];
-    const sep = this.cfg.dashboardPublicUrl.includes('?') ? '&' : '?';
-    const url = `${this.cfg.dashboardPublicUrl}${sep}token=${this.cfg.dashboardToken}`;
-    return [{ tag: 'note', elements: [{ tag: 'lark_md', content: `[📊 查看实时输出](${url})` }] }];
+    if (!this.cfg.dashboardEnabled) return [];
+    const url = this.dashboardUrl();
+    if (url) return [{ tag: 'note', elements: [{ tag: 'lark_md', content: `[📊 查看实时输出](${url})` }] }];
+    return [{ tag: 'note', elements: [{ tag: 'plain_text', content: '📊 发 /dashboard 开启实时输出' }] }];
   }
 
   // ---------------- 审批卡片 ----------------
@@ -230,23 +297,23 @@ export class Bridge {
     } else if (ev === 'stop') {
       await this.progressFlush(key, true);
       await this.channel.sendText(chatId, '✅ 本轮任务结束');
-      this.dashboard?.publish(chatId, 'progress', '✅ 本轮任务结束');
+      this.dashboardBus.publish(chatId, 'progress', '✅ 本轮任务结束');
     } else if (ev === 'stopfailure') {
       await this.progressFlush(key, true);
       await this.channel.sendText(chatId, `⚠️ 本轮出错结束：${truncate(String(payload.error_message ?? ''), 200)}`);
-      this.dashboard?.publish(chatId, 'progress', `⚠️ 本轮出错结束：${truncate(String(payload.error_message ?? ''), 200)}`);
+      this.dashboardBus.publish(chatId, 'progress', `⚠️ 本轮出错结束：${truncate(String(payload.error_message ?? ''), 200)}`);
     } else if (ev === 'interrupt') {
       await this.progressFlush(key, true);
       await this.channel.sendText(chatId, '⛔ 本轮被用户中断');
-      this.dashboard?.publish(chatId, 'progress', '⛔ 本轮被用户中断');
+      this.dashboardBus.publish(chatId, 'progress', '⛔ 本轮被用户中断');
     } else if (ev === 'sessionstart') {
       await this.channel.sendText(chatId, `🚀 新会话开始（${payload.source ?? ''}）：${sessionId.slice(0, 12)}`);
-      this.dashboard?.publish(chatId, 'progress', `🚀 新会话开始：${sessionId.slice(0, 12)}`);
+      this.dashboardBus.publish(chatId, 'progress', `🚀 新会话开始：${sessionId.slice(0, 12)}`);
     }
   }
 
   private progressLine(key: string, chatId: string, line: string): void {
-    this.dashboard?.publish(chatId, 'progress', line);
+    this.dashboardBus.publish(chatId, 'progress', line);
     let p = this.progress.get(key);
     if (!p) {
       p = { lines: [], lastUpdate: 0, chatId };
@@ -317,6 +384,30 @@ export class Bridge {
         `📊 状态\n任务：${busy ? '🏃 运行中' : '💤 空闲'}\n目录：\`${wd}\`\n` +
         `会话：${this.state.hasSession(chatId) ? '续接模式' : '新会话'}\n待审批：${this.approvals.pendingCount()} 条`,
       );
+    } else if (cmd === '/dashboard') {
+      if (!this.cfg.dashboardEnabled) {
+        await this.channel.sendText(chatId, 'Dashboard 已在配置中禁用（dashboard_enabled = false）');
+        return;
+      }
+      if (arg === 'off') {
+        // closeDashboard 的 onClose 回调会统一发关闭通知，这里只处理"未开启"的情况
+        if (!(await this.closeDashboard('飞书命令关闭'))) {
+          await this.channel.sendText(chatId, 'Dashboard 当前未开启');
+        }
+        return;
+      }
+      await this.channel.sendText(chatId, '⏳ 正在开启 Dashboard（拉起隧道，约几秒）…');
+      try {
+        const url = await this.openDashboard(chatId);
+        const pub = this.dashPublic ?? this.tunnel?.url;
+        await this.channel.sendText(
+          chatId,
+          `📊 Dashboard 已开启：\n${url}\n页面只读，可手动关闭；无人观看约 ${Math.round(this.cfg.dashboardIdleTimeoutNopage / 60)} 分钟、停看 ${Math.round(this.cfg.dashboardIdleTimeoutPage / 60)} 分钟自动关闭` +
+            (pub ? '' : '\n⚠️ cloudflared 不可用，此为局域网链接（公网访问需安装 cloudflared）'),
+        );
+      } catch (err) {
+        await this.channel.sendText(chatId, `❌ 开启 Dashboard 失败：${err instanceof Error ? err.message : err}`);
+      }
     } else if (cmd === '/help') {
       await this.channel.sendText(chatId, HELP_TEXT);
     } else {
@@ -433,6 +524,7 @@ export const HELP_TEXT = `🤖 kimi-code-feishu 使用指南
 /new          开启新会话（默认会续接上次会话）
 /stop         终止正在执行的任务
 /status       查看当前状态
+/dashboard    临时开启实时输出面板（/dashboard off 关闭）
 /id           查看你的 open_id
 /help         本帮助
 

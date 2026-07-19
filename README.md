@@ -109,6 +109,7 @@ journalctl --user -u kimi-code-feishu -f   # 看日志
 |---|---|
 | `帮我跑一下测试并修复失败用例` | 直接派任务（流式回报，危险操作弹审批卡片） |
 | `/bind /home/me/projects/foo` | 绑定本聊天的工作目录 |
+| `/dashboard` | 临时开启实时输出面板（`/dashboard off` 关闭） |
 | `/new` / `/stop` / `/status` / `/id` / `/help` | 会话管理 / 终止 / 状态 / 查 open_id / 帮助 |
 
 ### 工作目录绑定（/bind）
@@ -132,36 +133,28 @@ journalctl --user -u kimi-code-feishu -f   # 看日志
 
 终端里跑 `kimi --yolo`，审批闸门即完全交给飞书卡片，出门在外也能远程点头。
 
-## 五、Dashboard（本地 WebUI）
+## 五、Dashboard（按需开启的 WebUI）
 
-`run` 启动桥时会同时启动一个本地 Web Dashboard（默认 `127.0.0.1:17772`），实时展示所有任务的 **kimi 终端原始输出**（stdout / stderr / 任务启停 / 审批动作），浏览器打开启动日志里打印的带 token 地址即可：
+Dashboard 采用**按需开启**的安全模型——桥启动时**不**开启，用的时候才临时拉起：
 
 ```
-📊 Dashboard: http://127.0.0.1:17772/?token=xxxxxxxx
+/dashboard      # 飞书里发送，几秒后收到带 token 的公网链接
+/dashboard off  # 手动关闭（页面上的「关闭 Dashboard」按钮等效）
 ```
 
-- 按聊天过滤、自动滚动；新打开的页面会回放最近 500 条事件
-- 推送走 SSE，token 认证（`dashboard_token` 配置为空则每次启动随机生成）
-- 配置见 `[dashboard]` 节：`dashboard_enabled` / `dashboard_host` / `dashboard_port` / `dashboard_token`
+- 实时展示所有任务的 **kimi 终端输出**（stdout / stderr / 任务启停 / 审批动作），按聊天过滤、自动滚动，新打开的页面回放最近 500 条事件
+- **页面只读**，唯一操作是「关闭 Dashboard」按钮
+- 每次开启：**新随机 token + 新 cloudflared 隧道域名**（quick tunnel，无需公网 IP 和配置），上次的链接全部作废
+- **双阈值自动关闭**：没有打开的页面约 3 分钟关；页面停看（心跳停）10 分钟关——离开后不会一直挂在公网上
+- 配置见 `[dashboard]` 节：`dashboard_idle_timeout_page` / `dashboard_idle_timeout_nopage` / `dashboard_public_url`（固定域名才填）/ `cloudflared_bin` 等
 
-**转发为飞书网页应用（cloudflared）**：无需改配置、无需公网 IP，一条命令同时拉起桥和隧道：
-
-```bash
-bash deploy/run-with-tunnel.sh
-# 输出：🌐 Dashboard 公网地址：https://xxxx.trycloudflare.com
-```
-
-隧道域名会自动注入 `KCF_DASHBOARD_PUBLIC_URL`，审批/提问卡片底部的「📊 查看实时输出」在手机上（蜂窝网络）也能打开；飞书开放平台 → 应用功能 → **网页应用** 里填同一个带 token 的 URL 即可内嵌仪表盘。
-
-> quick tunnel 的域名**每次启动都会变**，重启后飞书网页应用后台要同步改地址；想固定域名，用 Cloudflare 账号建 named tunnel 并把 `dashboard_public_url` 写进配置。
-
-> ⚠️ 终端输出可能包含敏感信息，**token 即密码**：转发务必走 HTTPS，且不要把带 token 的 URL 发给不信任的人。
+> ⚠️ 终端输出可能包含敏感信息，**带 token 的链接等同于终端内容本身**，请勿转发；cloudflared 隧道全程 HTTPS。
 
 ## 六、安全设计
 
 - **白名单**：仅 `allowed_user_ids` 中的 open_id 能发指令、点卡片；其他人点击被忽略并记日志
 - **不出本机**：hook 服务只听 `127.0.0.1`；飞书走长连接，无入站端口
-- **Dashboard**：默认只听 `127.0.0.1` + token 认证；转发公网需自行承担暴露风险
+- **Dashboard**：按需开启 + 一次性 token/域名 + 双阈值自动关 + 页面只读，公网暴露窗口最小化
 - **fail-closed**：桥掉线时默认**拒绝**需审批操作（`fail_closed = false` 可改回官方 fail-open）
 - **紧急旁路**：`KCF_DISABLED=1` 后所有 hook 直接放行
 - Kimi hooks 是 Beta 且 fail-open 设计，不要当作唯一安全防线
@@ -171,7 +164,7 @@ bash deploy/run-with-tunnel.sh
 ```bash
 npm install
 npm run build          # tsc → dist/
-node dist/selfcheck.js # 54 项端到端自检（假通道 + 假 kimi，不需要真实飞书）
+node dist/selfcheck.js # 59 项端到端自检（假通道 + 假 kimi，不需要真实飞书）
 npm pack               # 产出可分发的 .tgz（约 20KB）
 ```
 
@@ -202,12 +195,13 @@ src/
 ├── hook.ts           # Kimi CLI hook 入口（stdin JSON → 桥 → 退出码/结构化输出）
 ├── hookServer.ts     # 127.0.0.1 HTTP 服务
 ├── kimiRunner.ts     # headless 任务运行器（spawn + 进程组管理）
-├── dashboard.ts      # 本地 WebUI（SSE 实时终端输出，token 认证）
+├── dashboard.ts      # 按需开启的 WebUI（SSE 实时输出，双阈值自动关）
+├── tunnel.ts         # cloudflared quick tunnel 托管（/dashboard 开启时拉起）
 ├── streamParser.ts   # stream-json 容错解析
 ├── approvals.ts      # 待审批注册表（Promise 挂起/唤醒）
 ├── state.ts          # 聊天绑定、会话路由持久化
 ├── installer.ts      # hooks 注入/移除（自动备份）
-└── selfcheck.ts      # 54 项端到端自检
+└── selfcheck.ts      # 59 项端到端自检
 ```
 
 ## License

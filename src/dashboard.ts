@@ -2,9 +2,10 @@
  * Dashboard：按需开启的本地 WebUI，实时展示各聊天任务的 kimi 终端输出。
  *
  * 安全模型（桥启动时**不**开启）：
- * - 飞书发 /dashboard 才临时拉起 HTTP 服务，每次开启生成新 token
+ * - 飞书发 /dashboard 才临时拉起 HTTP 服务，每次开启生成新 token、新隧道域名
  * - 页面只读，唯一操作是「关闭 Dashboard」按钮（POST /close）
- * - 闲置自动关闭：页面可见时每 30s 心跳保活，idleTimeoutMs 无心跳/新连接即关
+ * - 双阈值闲置自动关闭：没有打开的页面 → idleNopageMs 关；
+ *   有页面在看（可见时每 30s 心跳）→ 心跳停 idlePageMs 关
  *
  * 数据流：KimiRunner/Bridge → Dashboard.publish → SSE 广播给浏览器。
  * 无新依赖：原生 http + SSE（单向日志流，不需要 WebSocket）。
@@ -54,8 +55,10 @@ export interface DashboardServer {
 }
 
 export interface ServeDashboardOptions {
-  /** 无心跳/无新连接多久后自动关闭（毫秒）。 */
-  idleTimeoutMs: number;
+  /** 有页面在看时，心跳停多久后关闭（毫秒）。 */
+  idlePageMs: number;
+  /** 没有打开的页面时，多久后关闭（毫秒）。 */
+  idleNopageMs: number;
   /** 任何路径的关闭都会回调（闲置、页面关闭、主动 close）。 */
   onClose: (reason: string) => void;
 }
@@ -67,7 +70,8 @@ export function serveDashboard(
   token: string,
   opts: ServeDashboardOptions,
 ): Promise<DashboardServer> {
-  let lastActivity = Date.now();
+  let lastSignal = Date.now(); // 心跳/打开页面/SSE 接入都刷新
+  const sseClients = new Set<http.ServerResponse>();
   let closed = false;
 
   const server = http.createServer((req, res) => {
@@ -86,7 +90,7 @@ export function serveDashboard(
     }
 
     if (req.method === 'POST' && url.pathname === '/heartbeat') {
-      lastActivity = Date.now();
+      lastSignal = Date.now();
       res.writeHead(204);
       res.end();
       return;
@@ -98,7 +102,7 @@ export function serveDashboard(
       return;
     }
 
-    lastActivity = Date.now(); // 打开页面/接入 SSE 也算活动
+    lastSignal = Date.now(); // 打开页面/接入 SSE 也算活动
 
     if (url.pathname === '/events') {
       res.writeHead(200, {
@@ -107,9 +111,11 @@ export function serveDashboard(
         Connection: 'keep-alive',
       });
       dash.subscribe(res);
+      sseClients.add(res);
       const ping = setInterval(() => res.write(': ping\n\n'), PING_INTERVAL);
       req.on('close', () => {
         clearInterval(ping);
+        sseClients.delete(res);
         dash.unsubscribe(res);
       });
       return;
@@ -123,15 +129,23 @@ export function serveDashboard(
     if (closed) return;
     closed = true;
     clearInterval(idleCheck);
+    // server.close() 不会断开已建立的 SSE 长连接，必须显式销毁，否则永远关不掉
+    for (const res of sseClients) res.destroy();
+    sseClients.clear();
     await new Promise<void>((r) => server.close(() => r()));
     opts.onClose(reason);
   }
 
+  // 双阈值闲置关闭：有页面在看 → 心跳停 idlePageMs 关；没有页面 → idleNopageMs 关
+  const minIdle = Math.min(opts.idlePageMs, opts.idleNopageMs);
   const idleCheck = setInterval(() => {
-    if (Date.now() - lastActivity > opts.idleTimeoutMs) {
-      void shutdown(`闲置超过 ${Math.round(opts.idleTimeoutMs / 60000)} 分钟自动关闭`);
+    const limit = sseClients.size > 0 ? opts.idlePageMs : opts.idleNopageMs;
+    if (Date.now() - lastSignal > limit) {
+      void shutdown(sseClients.size > 0
+        ? `页面停看超过 ${Math.round(opts.idlePageMs / 60000)} 分钟自动关闭`
+        : `无人观看超过 ${Math.round(opts.idleNopageMs / 60000)} 分钟自动关闭`);
     }
-  }, IDLE_CHECK_INTERVAL);
+  }, Math.min(IDLE_CHECK_INTERVAL, Math.max(250, minIdle / 4)));
   idleCheck.unref();
 
   return new Promise((resolve, reject) => {

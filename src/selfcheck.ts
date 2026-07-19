@@ -297,14 +297,23 @@ async function main(): Promise<void> {
     await sleep(300);
     check('端到端: Interrupt 事件通知到飞书', channel.texts().some((t) => t.includes('中断')));
 
-    // 5.9 配置 dashboard_public_url 后审批卡片带链接
-    cfg.dashboardPublicUrl = 'https://dash.example.com';
-    cfg.dashboardToken = 'tok-xyz';
+    // 5.9 /dashboard 命令：假 cloudflared 开启 → 卡片带链接 → off 关闭
+    const fakeCf = path.join(tmp, 'fake_cloudflared');
+    fs.writeFileSync(fakeCf, '#!/bin/sh\necho "INFO https://fake-tunnel-xyz.trycloudflare.com registered"\nsleep 60\n', 'utf-8');
+    fs.chmodSync(fakeCf, 0o755);
+    cfg.cloudflaredBin = fakeCf;
+    cfg.dashboardPublicUrl = '';
+    cfg.dashboardPort = await freePort();
+
+    await bridge.onFeishuMessage('chat-1', 'ou_boss', '/dashboard');
+    check('Dashboard命令: 开启返回隧道链接',
+      channel.texts().some((t) => t.includes('已开启') && t.includes('fake-tunnel-xyz.trycloudflare.com')));
+
     const linkApprover = (async () => {
       for (let i = 0; i < 50; i++) {
         const cards = channel.cards();
         const last = cards[cards.length - 1];
-        if (last && JSON.stringify(last).includes('dash.example.com')) {
+        if (last && JSON.stringify(last).includes('fake-tunnel-xyz')) {
           const actions = (last.elements as Array<Record<string, unknown>>)[2].actions as Array<Record<string, unknown>>;
           bridge.onCardAction(actions[0].value as Record<string, unknown>, 'ou_boss');
           return true;
@@ -317,6 +326,9 @@ async function main(): Promise<void> {
       session_id: 's1', cwd: tmp, tool_name: 'Shell', tool_input: { command: 'make release' },
     });
     check('端到端: 审批卡片带 Dashboard 链接', (await linkApprover) && !isDeny(r.stdout));
+
+    await bridge.onFeishuMessage('chat-1', 'ou_boss', '/dashboard off');
+    check('Dashboard命令: off 关闭并通知', channel.texts().some((t) => t.includes('Dashboard 已关闭')));
 
     await hookServer.close();
   }
@@ -418,7 +430,7 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
   {
     const dash = new Dashboard();
     const port = await freePort();
-    const srv = await serveDashboard(dash, '127.0.0.1', port, 'tok123', { idleTimeoutMs: 600_000, onClose: () => {} });
+    const srv = await serveDashboard(dash, '127.0.0.1', port, 'tok123', { idlePageMs: 600_000, idleNopageMs: 600_000, onClose: () => {} });
     const base = `http://127.0.0.1:${port}`;
 
     const r1 = await fetch(`${base}/events`);
@@ -433,9 +445,34 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
     const r3 = await fetch(`${base}/events?token=tok123`, { signal: ac.signal });
     const reader = r3.body!.getReader();
     const { value } = await reader.read();
-    ac.abort();
     check('Dashboard: SSE 回放到已发布事件', new TextDecoder().decode(value).includes('hello-dashboard-xyz'));
-    await srv.close();
+
+    const hb = await fetch(`${base}/heartbeat?token=tok123`, { method: 'POST' });
+    check('Dashboard: 心跳保活 204', hb.status === 204);
+
+    // /close 关闭：SSE 连接被断开（流结束或连接被重置都算断开），服务不可达
+    await fetch(`${base}/close?token=tok123`, { method: 'POST' });
+    let sseClosed = false;
+    try {
+      sseClosed = (await reader.read()).done === true;
+    } catch {
+      sseClosed = true; // 服务器销毁连接（ECONNRESET/terminated）正是我们要的行为
+    }
+    check('Dashboard: 关闭时断开 SSE 连接', sseClosed);
+    let unreachable = false;
+    try { await fetch(`${base}/?token=tok123`); } catch { unreachable = true; }
+    check('Dashboard: 关闭后服务不可达', unreachable);
+    ac.abort();
+
+    // 无页面闲置自动关闭
+    const dash2 = new Dashboard();
+    const port2 = await freePort();
+    let closedReason = '';
+    await serveDashboard(dash2, '127.0.0.1', port2, 't', { idlePageMs: 5000, idleNopageMs: 800, onClose: (r) => { closedReason = r; } });
+    await sleep(2500);
+    let down = false;
+    try { await fetch(`http://127.0.0.1:${port2}/health`); } catch { down = true; }
+    check('Dashboard: 无人观看闲置自动关闭', down && closedReason.includes('无人观看'));
   }
 
   // ---------------------------------------------------------------- 汇总
