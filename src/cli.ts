@@ -2,7 +2,8 @@
 /**
  * kimi-code-feishu 命令行入口。
  *
- *   kimi-code-feishu init        生成示例配置 ~/.kimi-code-feishu/config.toml
+ *   kimi-code-feishu onboard    扫码创建飞书应用并写入配置（推荐）
+ *   kimi-code-feishu init        生成示例配置 ~/.kimi-code-feishu/config.toml（手动填写）
  *   kimi-code-feishu install     把 hooks 写入 Kimi CLI 配置
  *   kimi-code-feishu uninstall   移除 hooks
  *   kimi-code-feishu run         启动桥服务（hook server + 飞书长连接）
@@ -10,8 +11,11 @@
  */
 import { execFileSync } from 'node:child_process';
 import net from 'node:net';
+import * as readline from 'node:readline/promises';
+import QRCode from 'qrcode';
+import { pollAppRegistration, RegistrationError, requestAppRegistration } from './appRegistration.js';
 import { Bridge } from './bridge.js';
-import { loadConfig, saveExampleConfig } from './config.js';
+import { loadConfig, saveConfig, saveExampleConfig } from './config.js';
 import { FeishuChannel } from './feishuChannel.js';
 import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
@@ -26,6 +30,91 @@ function cmdInit(args: string[]): number {
   const p = saveExampleConfig(argValue(args, '--kcf-config'));
   console.log(`配置文件已生成：${p}\n请编辑填入 app_id / app_secret / allowed_user_ids 后再运行。`);
   return 0;
+}
+
+/** 扫码创建飞书应用：飞书官方 Device-Flow 应用注册，凭证自动写入配置。 */
+async function onboardScan(cfgPath?: string): Promise<number> {
+  console.log('正在向飞书发起应用注册…');
+  const begin = await requestAppRegistration();
+  console.log('\n请用「飞书」手机 App 扫描下方二维码，并在确认页点击确认：\n');
+  console.log(await QRCode.toString(begin.verificationUrl, { type: 'terminal', small: true }));
+  console.log(`扫不出来也可以手动打开链接：\n${begin.verificationUrl}\n`);
+  console.log(`等待确认中（${Math.round(begin.expiresIn / 60)} 分钟内有效）…`);
+
+  let result;
+  try {
+    result = await pollAppRegistration(begin);
+  } catch (err) {
+    if (err instanceof RegistrationError) {
+      console.log(`❌ ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+
+  if (result.tenantBrand && result.tenantBrand !== 'feishu') {
+    console.log(`⚠️  当前租户是 Lark（国际版），本桥目前只支持飞书（feishu）域名，请用飞书账号扫码。`);
+    return 1;
+  }
+
+  const p = writeOnboardConfig(cfgPath, result.clientId, result.clientSecret, result.openId);
+  console.log(`\n✅ 应用创建成功，配置已写入：${p}`);
+  console.log(`   app_id = ${result.clientId}`);
+  if (result.openId) console.log(`   你的 open_id 已加入 allowed_user_ids：${result.openId}`);
+  else console.log('   未拿到 open_id，请私聊机器人发 /id 后自行填入 allowed_user_ids');
+  // 注册协议（PersonalAgent 模板）不支持自定义应用名，但确认页可直接改
+  console.log(`   提示：应用名可在手机确认页直接修改；事后改名请前往开发者后台`);
+  console.log(`   https://open.feishu.cn/app/${result.clientId}/baseinfo （事后改名需创建新版本并发布后生效）`);
+  return 0;
+}
+
+/** 手动输入已有应用的凭证。 */
+async function onboardManual(cfgPath: string | undefined, ask: (q: string) => Promise<string>): Promise<number> {
+  const appId = await ask('App ID（cli_ 开头）：');
+  const appSecret = await ask('App Secret：');
+  const openId = await ask('你的 open_id（可留空，稍后私聊机器人发 /id 获取）：');
+  if (!appId || !appSecret) {
+    console.log('❌ App ID 和 App Secret 不能为空');
+    return 1;
+  }
+  const p = writeOnboardConfig(cfgPath, appId, appSecret, openId || undefined);
+  console.log(`\n✅ 配置已写入：${p}`);
+  if (!openId) console.log('   启动桥后私聊机器人发 /id，把返回的 ou_xxx 填入 allowed_user_ids 并重启桥');
+  return 0;
+}
+
+function writeOnboardConfig(cfgPath: string | undefined, appId: string, appSecret: string, openId?: string): string {
+  return saveConfig(
+    { appId, appSecret, allowedUserIds: openId ? [openId] : [], workDir: process.env.HOME },
+    cfgPath,
+  );
+}
+
+/**
+ * 逐行提问。用 readline 的异步迭代器而非 rl.question：
+ * 管道输入时所有行瞬间到达，question 模式会丢弃两次提问之间到达的行。
+ */
+function makeAsk(): (q: string) => Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin });
+  const it = rl[Symbol.asyncIterator]();
+  return async (q: string) => {
+    process.stdout.write(q);
+    const { value, done } = await it.next();
+    if (done) rl.close();
+    return (value ?? '').trim();
+  };
+}
+
+async function cmdOnboard(args: string[]): Promise<number> {
+  const cfgPath = argValue(args, '--kcf-config');
+  console.log('飞书应用接入方式：');
+  console.log('  1) 扫码创建新应用（推荐）');
+  console.log('  2) 手动输入已有应用的 App ID / App Secret');
+  const ask = makeAsk();
+  const choice = await ask('请选择 [1/2]（默认 1）：');
+  const code = choice === '2' ? await onboardManual(cfgPath, ask) : await onboardScan(cfgPath);
+  if (code === 0) console.log('\n下一步：kimi-code-feishu run 启动桥，然后私聊机器人测试；install 可注入 hooks。');
+  return code;
 }
 
 function cmdInstall(args: string[]): number {
@@ -125,12 +214,14 @@ async function main(): Promise<number> {
   const rest = args.slice(1);
   switch (command) {
     case 'init': return cmdInit(rest);
+    case 'onboard': return cmdOnboard(rest);
     case 'install': return cmdInstall(rest);
     case 'uninstall': return cmdUninstall(rest);
     case 'doctor': return cmdDoctor(rest);
     case 'run': return cmdRun(rest);
     default:
-      console.log(`用法: kimi-code-feishu <init|install|uninstall|run|doctor> [选项]
+      console.log(`用法: kimi-code-feishu <onboard|init|install|uninstall|run|doctor> [选项]
+  onboard                扫码创建飞书应用并自动写入配置（推荐）
   --kcf-config <path>      桥配置文件路径（默认 ~/.kimi-code-feishu/config.toml）
   --kimi-config <path>     Kimi CLI 配置文件路径（install/uninstall，默认自动探测）
   --approval-timeout <秒>  审批等待秒数（install，默认 150）`);

@@ -4,6 +4,7 @@
  */
 import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,8 +12,9 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parse as parseToml } from 'smol-toml';
 import { ApprovalManager } from './approvals.js';
+import { pollAppRegistration, RegistrationError, requestAppRegistration } from './appRegistration.js';
 import { Bridge, toolInputSummary } from './bridge.js';
-import { loadConfig } from './config.js';
+import { loadConfig, saveConfig } from './config.js';
 import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
 import { StateStore } from './state.js';
@@ -112,6 +114,15 @@ async function main(): Promise<void> {
     check('配置加载: app_id', cfg.appId === 'cli_test');
     check('配置加载: approval_timeout', cfg.approvalTimeout === 10);
     check('配置加载: 默认 auto_allow_tools 非空', cfg.autoAllowTools.length > 3);
+
+    // onboard 写入配置：renderExampleConfig 带真实值 → 合法 TOML 且可回读
+    const cfgPath2 = path.join(tmp, 'onboard.toml');
+    saveConfig({ appId: 'cli_onboard', appSecret: 'sec_onboard', allowedUserIds: ['ou_scan'] }, cfgPath2);
+    const cfg2 = loadConfig(cfgPath2);
+    check('配置写入: 真实值可解析回读', cfg2.appId === 'cli_onboard' && cfg2.allowedUserIds.includes('ou_scan'));
+    let overwriteThrew = false;
+    try { saveConfig({ appId: 'x', appSecret: 'y' }, cfgPath2); } catch { overwriteThrew = true; }
+    check('配置写入: 拒绝覆盖已有文件', overwriteThrew);
   }
 
   // ---------------------------------------------------------------- 2. 解析器
@@ -308,6 +319,57 @@ echo '{"type":"assistant","message":{"content":[{"type":"text","text":"完成：
     check('任务: 流式执行并回报结果', done);
     check('任务: 会话标记已置位', state.hasSession('chat-9'));
     check('任务: 有执行中消息', channel.texts().some((t) => t.includes('执行中') || t.includes('已开工')));
+  }
+
+  // ---------------------------------------------------------------- 8. 扫码注册流程（mock accounts 服务）
+  {
+    let beginCount = 0;
+    let pollCount = 0;
+    const srv = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        const form = new URLSearchParams(body);
+        const action = form.get('action');
+        let out: Record<string, unknown>;
+        if (action === 'begin') {
+          beginCount++;
+          out = { device_code: beginCount === 1 ? 'dc-ok' : 'dc-deny', user_code: 'ABCD-EFGH', expire_in: 30, interval: 1 };
+        } else if (action === 'poll') {
+          if (form.get('device_code') === 'dc-deny') {
+            out = { error: 'access_denied' };
+          } else {
+            pollCount++;
+            out = pollCount < 3
+              ? { error: 'authorization_pending' }
+              : { client_id: 'cli_scan', client_secret: 'sec_scan', user_info: { open_id: 'ou_scan', tenant_brand: 'feishu' } };
+          }
+        } else {
+          out = { error: 'bad_action' };
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out));
+      });
+    });
+    const port = await freePort();
+    await new Promise<void>((r) => srv.listen(port, '127.0.0.1', () => r()));
+    const eps = { accountsBase: `http://127.0.0.1:${port}`, openBase: 'https://open.feishu.cn' };
+
+    const begin = await requestAppRegistration(eps);
+    check('注册: begin 返回 device_code 与验证链接',
+      begin.deviceCode === 'dc-ok' && begin.verificationUrl.includes('user_code=ABCD-EFGH'));
+    const reg = await pollAppRegistration(begin, eps);
+    check('注册: 轮询成功拿到凭证与 open_id', reg.clientId === 'cli_scan' && reg.openId === 'ou_scan');
+
+    const begin2 = await requestAppRegistration(eps);
+    let denied = false;
+    try {
+      await pollAppRegistration(begin2, eps);
+    } catch (err) {
+      denied = err instanceof RegistrationError && err.code === 'access_denied';
+    }
+    check('注册: access_denied 正确抛出', denied);
+    await new Promise<void>((r) => srv.close(() => r()));
   }
 
   // ---------------------------------------------------------------- 汇总

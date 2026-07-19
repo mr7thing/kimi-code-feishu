@@ -78,16 +78,24 @@ export function configPathFromEnv(): string {
   return process.env.KCF_CONFIG ?? DEFAULT_CONFIG_PATH;
 }
 
-const EXAMPLE_CONFIG = `# kimi-code-feishu 配置
+export interface ExampleConfigValues {
+  appId?: string;
+  appSecret?: string;
+  allowedUserIds?: string[];
+  workDir?: string;
+}
+
+export function renderExampleConfig(v: ExampleConfigValues = {}): string {
+  return `# kimi-code-feishu 配置
 # 飞书开放平台 → 企业自建应用 → 凭证与基础信息
-app_id = "cli_xxxxxxxx"
-app_secret = "xxxxxxxx"
+app_id = "${v.appId ?? 'cli_xxxxxxxx'}"
+app_secret = "${v.appSecret ?? 'xxxxxxxx'}"
 
 # 允许操控机器人的飞书用户 open_id（给机器人私聊发 /id 可获取自己的）
-allowed_user_ids = ["ou_xxxxxxxx"]
+allowed_user_ids = [${(v.allowedUserIds?.length ? v.allowedUserIds : ['ou_xxxxxxxx']).map((s) => `"${s}"`).join(', ')}]
 
 # 默认工作目录（飞书里可用 /bind 按会话覆盖）
-work_dir = "/home/yourname/projects"
+work_dir = "${v.workDir ?? '/home/yourname/projects'}"
 
 [bridge]
 bridge_host = "127.0.0.1"
@@ -107,6 +115,7 @@ task_timeout = 7200
 progress_enabled = true
 forward_terminal_sessions = true   # 终端里手动启动的 kimi 会话也推送到飞书
 `;
+}
 
 /** snake_case 配置文件键 → camelCase Config 字段 */
 const KEY_MAP: Record<string, keyof Config> = {
@@ -169,6 +178,15 @@ export function saveExampleConfig(configPath?: string): string {
   const p = configPath ?? configPathFromEnv();
   if (fs.existsSync(p)) return p;
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, EXAMPLE_CONFIG, { encoding: 'utf-8', mode: 0o600 });
+  fs.writeFileSync(p, renderExampleConfig(), { encoding: 'utf-8', mode: 0o600 });
+  return p;
+}
+
+/** 写入带真实值的配置；文件已存在时抛错，避免覆盖已有配置。 */
+export function saveConfig(values: ExampleConfigValues, configPath?: string): string {
+  const p = configPath ?? configPathFromEnv();
+  if (fs.existsSync(p)) throw new Error(`配置文件已存在：${p}（如需重建请先备份后删除）`);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, renderExampleConfig(values), { encoding: 'utf-8', mode: 0o600 });
   return p;
 }

@@ -38,7 +38,27 @@ npm install && npm run build && npm link
 
 安装后得到 `kimi-code-feishu` 命令。
 
-## 二、创建飞书应用（约 5 分钟）
+## 二、创建飞书应用（约 1 分钟）
+
+```bash
+kimi-code-feishu onboard
+```
+
+onboard 提供两种接入方式，启动后按提示选择：
+
+### 方式 1：扫码即创（推荐）
+
+终端显示二维码，用**飞书手机 App 扫码**并在官方确认页点确认即可——飞书服务端自动创建好带机器人能力和消息权限的应用，`app_id` / `app_secret` 和你的 `open_id`（自动加入 `allowed_user_ids`）会直接写入配置，无需手动创建应用。
+
+> 原理：飞书官方账号体系的 Device-Flow 应用注册协议（与官方开源 [larksuite/cli](https://github.com/larksuite/cli) 相同），全程匿名调用、无需公网回调，配置写入后仍需手动 `run` 启动桥。
+> 扫码创建用的是官方预置模板（PersonalAgent），审批卡片所需的 `card.action.trigger` 等配置已包含；如后续需要额外权限（文档、日历等），仍需到开发者后台补配。
+> 应用名默认为官方模板名（如「CLI 助手」）：扫码时在**手机确认页上可以直接修改**；事后改名请到开发者后台「凭证与基础信息」页（`https://open.feishu.cn/app/<appId>/baseinfo`），需创建新版本并发布才生效。
+
+### 方式 2：手动输入已有应用的凭证
+
+在 onboard 菜单选 `2`，粘贴已有的 **App ID** / **App Secret**（open_id 可留空，之后私聊机器人发 `/id` 获取再补填）。适合已经有配置好的应用、或需要自定义权限模板的场景。也可用 `kimi-code-feishu init` 生成配置模板后手动编辑。
+
+手动创建应用的步骤：
 
 1. [飞书开放平台](https://open.feishu.cn/app) → **创建企业自建应用**（如「Kimi 遥控器」）。
 2. **添加应用能力** → 机器人。
@@ -53,10 +73,10 @@ npm install && npm run build && npm link
 ## 三、配置与启动
 
 ```bash
-kimi-code-feishu init                  # 生成 ~/.kimi-code-feishu/config.toml
-# 编辑配置填入 app_id / app_secret；allowed_user_ids 可先留空
+kimi-code-feishu onboard               # 扫码创建应用并自动写入配置（推荐，见上一节）
+# 或手动方式：kimi-code-feishu init 生成 ~/.kimi-code-feishu/config.toml 后自行填入凭证
 kimi-code-feishu run                   # 启动桥（保持运行）
-# 手机飞书私聊机器人发 /id → 把返回的 ou_xxx 填入 allowed_user_ids → 重启桥
+# 手动方式还需：手机飞书私聊机器人发 /id → 把返回的 ou_xxx 填入 allowed_user_ids → 重启桥
 
 # 另一个终端：把 hooks 写入 Kimi CLI 配置（自动探测 ~/.kimi 或 ~/.kimi-code，自动备份）
 kimi-code-feishu install
@@ -90,6 +110,16 @@ nohup kimi-code-feishu run > ~/.kimi-code-feishu/bridge.log 2>&1 &
 | `/bind /home/me/projects/foo` | 绑定本聊天的工作目录 |
 | `/new` / `/stop` / `/status` / `/id` / `/help` | 会话管理 / 终止 / 状态 / 查 open_id / 帮助 |
 
+### 工作目录绑定（/bind）
+
+一个聊天 ≈ 一个项目的远程遥控窗口。`/bind` 决定三件事：
+
+1. **任务执行位置**：派任务时桥以绑定目录为 cwd 拉起 `kimi -p`，AI 读写文件、跑命令都在这个目录下；不绑则用配置里的默认 `work_dir`。
+2. **会话续接锚点**：默认用 `kimi -c` 续接该目录的最近一次会话；换绑目录即开启另一条会话线，上下文互不串。
+3. **终端会话路由**：终端里手动跑 `kimi` 时产生的审批卡片和进度推送，按会话 cwd 匹配到绑了同目录的聊天。
+
+不同聊天（多个私聊/群）可各绑各的项目，互不影响；`/bind` 会同时重置该聊天的会话（等同 `/new`）。
+
 ### 审批卡片
 
 - **✅ 批准**：放行这一次；**🔁 本会话允许**：同会话同类工具自动放行；**❌ 拒绝**：阻断并把原因反馈给模型
@@ -117,14 +147,14 @@ nohup kimi-code-feishu run > ~/.kimi-code-feishu/bridge.log 2>&1 &
 | 审批等待 | threading.Event | pending Promise |
 | hook 入口 | `python -m kimi_code_feishu.hook` | `node dist/hook.js`（绝对路径，免 PYTHONPATH） |
 | 配置文件 | 同一份，完全兼容 | 同一份，完全兼容 |
-| 自检 | 33 项 | 36 项 |
+| 自检 | 33 项 | 41 项 |
 
 ## 七、开发与自检
 
 ```bash
 npm install
 npm run build          # tsc → dist/
-node dist/selfcheck.js # 36 项端到端自检（假通道 + 假 kimi，不需要真实飞书）
+node dist/selfcheck.js # 41 项端到端自检（假通道 + 假 kimi，不需要真实飞书）
 npm pack               # 产出可分发的 .tgz（约 20KB）
 ```
 
@@ -146,7 +176,8 @@ SDK 1.71+ 已修复旧版 `reConnect()` 定时器泄漏（上游 #177），`auto
 
 ```
 src/
-├── cli.ts            # bin 入口：init / install / uninstall / run / doctor
+├── cli.ts            # bin 入口：onboard / init / install / uninstall / run / doctor
+├── appRegistration.ts # 扫码创建飞书应用（官方 Device-Flow 注册协议）
 ├── config.ts         # 配置加载（smol-toml + KCF_* 环境变量）
 ├── bridge.ts         # 核心编排：审批、进度、指令三条链路
 ├── feishuChannel.ts  # 飞书长连接通道（@larksuiteoapi/node-sdk）
@@ -158,7 +189,7 @@ src/
 ├── approvals.ts      # 待审批注册表（Promise 挂起/唤醒）
 ├── state.ts          # 聊天绑定、会话路由持久化
 ├── installer.ts      # hooks 注入/移除（自动备份）
-└── selfcheck.ts      # 36 项端到端自检
+└── selfcheck.ts      # 41 项端到端自检
 ```
 
 ## License
