@@ -16,6 +16,7 @@ import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
 import type { StreamEvent } from './streamParser.js';
 import { startCloudflaredTunnel, type TunnelHandle } from './tunnel.js';
+import { captureTmux, listKimiSessions, sendTmuxText } from './tmux.js';
 
 const MAX_TEXT = 3500;         // 飞书单条文本消息的保守上限
 const PROGRESS_INTERVAL = 1500; // 进度消息最小更新间隔（毫秒）
@@ -408,6 +409,53 @@ export class Bridge {
       } catch (err) {
         await this.channel.sendText(chatId, `❌ 开启 Dashboard 失败：${err instanceof Error ? err.message : err}`);
       }
+    } else if (cmd === '/a') {
+      const sessions = await listKimiSessions();
+      if (arg) {
+        const n = Number(arg);
+        if (!Number.isInteger(n) || n < 1 || n > sessions.length) {
+          await this.channel.sendText(chatId, '序号无效，发 /a 查看列表');
+          return;
+        }
+        const s = sessions[n - 1];
+        this.state.setAttach(chatId, s.target);
+        await this.channel.sendText(chatId, `🔗 已绑定终端会话：${s.name}\n目录：\`${s.cwd}\`\n/t <文本> 注入回车，/s 查看画面，/a 重新选择`);
+        return;
+      }
+      if (!sessions.length) {
+        await this.channel.sendText(chatId, '没有发现 tmux 里的 kimi 会话。\n先在终端用 `kimi-code-feishu tmux` 启动（或在任意 tmux 里跑 kimi）');
+        return;
+      }
+      const cur = this.state.getAttach(chatId);
+      await this.channel.sendText(
+        chatId,
+        '🖥 终端会话（/a 序号 绑定）：\n' +
+          sessions.map((s, i) => `${i + 1}. ${s.name}  \`${s.cwd}\`${s.target === cur ? '  ← 当前绑定' : ''}`).join('\n'),
+      );
+    } else if (cmd === '/t') {
+      const target = this.state.getAttach(chatId);
+      if (!target) {
+        await this.channel.sendText(chatId, '先用 /a 绑定一个终端会话');
+        return;
+      }
+      try {
+        await sendTmuxText(target, arg);
+        this.dashboardBus.publish(chatId, 'progress', `⌨️ /t 注入：${truncate(arg || '(回车)', 120)}`);
+      } catch {
+        await this.channel.sendText(chatId, '❌ 注入失败（会话可能已退出），/a 重新选择');
+      }
+    } else if (cmd === '/s') {
+      const target = this.state.getAttach(chatId);
+      if (!target) {
+        await this.channel.sendText(chatId, '先用 /a 绑定一个终端会话');
+        return;
+      }
+      try {
+        const shot = await captureTmux(target, 30);
+        await this.channel.sendText(chatId, '🖥 当前画面：\n```\n' + truncate(shot.trimEnd() || '（空）', 2600) + '\n```');
+      } catch {
+        await this.channel.sendText(chatId, '❌ 读取画面失败（会话可能已退出），/a 重新选择');
+      }
     } else if (cmd === '/help') {
       await this.channel.sendText(chatId, HELP_TEXT);
     } else {
@@ -525,6 +573,9 @@ export const HELP_TEXT = `🤖 kimi-code-feishu 使用指南
 /stop         终止正在执行的任务
 /status       查看当前状态
 /dashboard    临时开启实时输出面板（/dashboard off 关闭）
+/a            列出终端 tmux 会话；/a 序号 绑定到本聊天
+/t <文本>     向绑定会话注入文本+回车（空文本=只回车）
+/s            查看绑定会话当前画面
 /id           查看你的 open_id
 /help         本帮助
 

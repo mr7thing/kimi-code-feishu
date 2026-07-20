@@ -20,6 +20,7 @@ import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
 import { StateStore } from './state.js';
 import { parseLine } from './streamParser.js';
+import { captureTmux, listKimiSessions, sendTmuxText } from './tmux.js';
 import type { Channel } from './channel.js';
 
 const execFileP = promisify(execFile);
@@ -473,6 +474,52 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
     let down = false;
     try { await fetch(`http://127.0.0.1:${port2}/health`); } catch { down = true; }
     check('Dashboard: 无人观看闲置自动关闭', down && closedReason.includes('无人观看'));
+  }
+
+  // ---------------------------------------------------------------- 10. tmux 集成
+  {
+    let hasTmux = true;
+    try { await execFileP('tmux', ['-V']); } catch { hasTmux = false; }
+    if (!hasTmux) {
+      console.log('⏭️  未安装 tmux，跳过 tmux 集成测试');
+    } else {
+      const sess = 'kcf-selfcheck';
+      await execFileP('tmux', ['new-session', '-d', '-s', sess, 'cat']);
+      try {
+        await sleep(300);
+        const sessions = await listKimiSessions();
+        const found = sessions.find((s) => s.name === sess);
+        check('tmux: 发现 kcf-* 会话', !!found);
+        const target = found!.target;
+
+        await sendTmuxText(target, 'hello-kcf');
+        await sleep(300);
+        check('tmux: 注入并抓到画面', (await captureTmux(target, 5)).includes('hello-kcf'));
+
+        // 桥命令 /a /t /s（用真实 tmux 会话端到端）
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kcf-tmux-'));
+        const cfg = loadConfig(makeConfig(tmp, await freePort()));
+        const state = new StateStore(path.join(tmp, 'state.json'));
+        const channel = new FakeChannel();
+        const bridge = new Bridge(cfg, state, channel);
+
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/a');
+        check('命令: /a 列出会话', channel.texts().some((t) => t.includes(sess)));
+
+        const idx = (await listKimiSessions()).findIndex((s) => s.name === sess) + 1;
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', `/a ${idx}`);
+        check('命令: /a 序号绑定会话', state.getAttach('chat-t') === target);
+
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/t world-inject');
+        await sleep(300);
+        check('命令: /t 注入生效', (await captureTmux(target, 5)).includes('world-inject'));
+
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/s');
+        check('命令: /s 返回画面', channel.texts().some((t) => t.includes('当前画面')));
+      } finally {
+        await execFileP('tmux', ['kill-session', '-t', sess]).catch(() => {});
+      }
+    }
   }
 
   // ---------------------------------------------------------------- 汇总

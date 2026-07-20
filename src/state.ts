@@ -9,6 +9,7 @@ import { DEFAULT_CONFIG_DIR } from './config.js';
 interface ChatInfo {
   work_dir?: string;
   has_session?: boolean;
+  attach?: string;
 }
 
 interface StateData {
@@ -56,6 +57,17 @@ export class StateStore {
 
   setHasSession(chatId: string, value: boolean): void {
     (this.data.chats[chatId] ??= {}).has_session = value;
+    this.save();
+  }
+
+  /** 聊天绑定的 tmux 会话目标（/a 绑定，/t /s 使用） */
+  getAttach(chatId: string): string | null {
+    return this.data.chats[chatId]?.attach ?? null;
+  }
+
+  setAttach(chatId: string, target: string | null): void {
+    if (target === null) delete this.data.chats[chatId]?.attach;
+    else (this.data.chats[chatId] ??= {}).attach = target;
     this.save();
   }
 

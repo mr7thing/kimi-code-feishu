@@ -7,9 +7,11 @@
  *   kimi-code-feishu install     把 hooks 写入 Kimi CLI 配置
  *   kimi-code-feishu uninstall   移除 hooks
  *   kimi-code-feishu run         启动桥服务（hook server + 飞书长连接）
+ *   kimi-code-feishu tmux        在 tmux 里启动 kimi 会话（飞书 /a 可绑定注入）
  *   kimi-code-feishu doctor      环境自检
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import net from 'node:net';
 import * as readline from 'node:readline/promises';
 import QRCode from 'qrcode';
@@ -134,6 +136,18 @@ function cmdUninstall(args: string[]): number {
   return 0;
 }
 
+/** 在 tmux 里启动一个规范命名的 kimi 会话（kcf-*），桥才能发现和注入。 */
+function cmdTmux(args: string[]): number {
+  if (!which('tmux')) {
+    console.log('未安装 tmux：sudo apt install tmux');
+    return 1;
+  }
+  const name = `kcf-${argValue(args, '--name') ?? crypto.randomBytes(3).toString('hex')}`;
+  console.log(`启动 tmux 会话 ${name}（Ctrl+B D 脱离后可在飞书 /a 找到）`);
+  const r = spawnSync('tmux', ['new-session', '-A', '-s', name, '-c', process.cwd(), 'kimi'], { stdio: 'inherit' });
+  return r.status ?? 1;
+}
+
 function which(bin: string): boolean {
   try {
     execFileSync(process.platform === 'win32' ? 'where' : 'which', [bin], { stdio: 'ignore' });
@@ -223,11 +237,13 @@ async function main(): Promise<number> {
     case 'onboard': return cmdOnboard(rest);
     case 'install': return cmdInstall(rest);
     case 'uninstall': return cmdUninstall(rest);
+    case 'tmux': return cmdTmux(rest);
     case 'doctor': return cmdDoctor(rest);
     case 'run': return cmdRun(rest);
     default:
-      console.log(`用法: kimi-code-feishu <onboard|init|install|uninstall|run|doctor> [选项]
+      console.log(`用法: kimi-code-feishu <onboard|init|install|uninstall|run|doctor|tmux> [选项]
   onboard                扫码创建飞书应用并自动写入配置（推荐）
+  tmux                   在 tmux 里启动 kimi 会话（kcf-* 命名，飞书 /a 可绑定）
   --kcf-config <path>      桥配置文件路径（默认 ~/.kimi-code-feishu/config.toml）
   --kimi-config <path>     Kimi CLI 配置文件路径（install/uninstall，默认自动探测）
   --approval-timeout <秒>  审批等待秒数（install，默认 150）`);
