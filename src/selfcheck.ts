@@ -353,6 +353,47 @@ async function main(): Promise<void> {
     await bridge.onFeishuMessage('chat-1', 'ou_boss', '/dashboard off');
     check('Dashboard命令: off 关闭并通知', channel.texts().some((t) => t.includes('Dashboard 已关闭')));
 
+    // 5.10 AUQ 答题卡 → send-keys 注入 tmux（需要 tmux）
+    let tmuxOk = true;
+    try { await execFileP('tmux', ['-V']); } catch { tmuxOk = false; }
+    if (!tmuxOk) {
+      console.log('⏭️  无 tmux，跳过 AUQ 注入测试');
+    } else {
+      const sess = 'kcf-auqchk';
+      await execFileP('tmux', ['new-session', '-d', '-s', sess, '-c', tmp, 'cat']);
+      try {
+        await sleep(300);
+        r = await runHook(cfgPath, 'pre_tool_use', {
+          session_id: 's-auq', cwd: tmp, tool_name: 'AskUserQuestion',
+          tool_input: { questions: [{ question: '选哪个？', options: [{ label: '甲' }, { label: '乙' }] }] },
+        });
+        check('答题: hook 直接放行让 TUI 出题', r.stdout.trim() === '' && r.code === 0);
+
+        let resultCard: Record<string, unknown> | null = null;
+        for (let i = 0; i < 50 && !resultCard; i++) {
+          const cards = channel.cards();
+          const last = cards[cards.length - 1];
+          if (last && JSON.stringify(last).includes('选哪个')) {
+            for (const el of last.elements as Array<Record<string, unknown>>) {
+              if (el.tag !== 'action') continue;
+              for (const b of el.actions as Array<Record<string, unknown>>) {
+                const v = b.value as Record<string, unknown>;
+                if (v?.kcf === 'auq' && v.a === 1) resultCard = bridge.onCardAction(v, 'ou_boss');
+              }
+            }
+          }
+          if (resultCard) break;
+          await sleep(100);
+        }
+        check('答题: 点击返回结果卡片', !!resultCard && JSON.stringify(resultCard).includes('已作答'));
+        await sleep(400);
+        const pane = await captureTmux((await listKimiSessions()).find((s) => s.name === sess)!.target, 5);
+        check('答题: send-keys 注入到 tmux 会话', pane.includes('2'));
+      } finally {
+        await execFileP('tmux', ['kill-session', '-t', sess]).catch(() => {});
+      }
+    }
+
     await hookServer.close();
   }
 

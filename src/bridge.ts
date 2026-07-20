@@ -11,12 +11,13 @@ import { ApprovalManager } from './approvals.js';
 import type { Channel } from './channel.js';
 import type { Config } from './config.js';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import { Dashboard, serveDashboard, type DashboardServer } from './dashboard.js';
 import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
 import type { StreamEvent } from './streamParser.js';
 import { startCloudflaredTunnel, type TunnelHandle } from './tunnel.js';
-import { captureTmux, listKimiSessions, sendTmuxText } from './tmux.js';
+import { captureTmux, listKimiSessions, sendTmuxKeys, sendTmuxText } from './tmux.js';
 
 const MAX_TEXT = 3500;         // 飞书单条文本消息的保守上限
 const PROGRESS_INTERVAL = 1500; // 进度消息最小更新间隔（毫秒）
@@ -50,6 +51,38 @@ function decidedTextFor(decision: string): string | null {
 
 type HookResponse = { decision: string; reason?: string };
 
+type AuqQuestion = { question: string; header?: string; multi: boolean; options: string[] };
+
+/** 解析 AskUserQuestion 的 tool_input；解析不出有效问题返回空数组。 */
+function parseAuqQuestions(ti: unknown): AuqQuestion[] {
+  if (!ti || typeof ti !== 'object' || Array.isArray(ti)) return [];
+  const qs = (ti as Record<string, unknown>).questions;
+  if (!Array.isArray(qs)) return [];
+  const out: AuqQuestion[] = [];
+  for (const q of qs.slice(0, 4)) {
+    if (!q || typeof q !== 'object') continue;
+    const rec = q as Record<string, unknown>;
+    const question = String(rec.question ?? '').trim();
+    const options = (Array.isArray(rec.options) ? rec.options : [])
+      .map((o) => String((o as Record<string, unknown>)?.label ?? '').trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (!question || options.length < 2) continue;
+    const header = String(rec.header ?? '').trim();
+    out.push({ question, header: header || undefined, multi: rec.multi_select === true, options });
+  }
+  return out;
+}
+
+/** 进行中的提问（等用户点卡片）：reqId → 注入目标与状态。 */
+interface PendingAuq {
+  chatId: string;
+  tmuxTarget: string;
+  messageId?: string;
+  question: AuqQuestion;
+  sel: Set<number>;
+}
+
 interface ProgressState {
   messageId?: string;
   lines: string[];
@@ -72,6 +105,7 @@ export class Bridge {
   private dashPublic?: string;
   private tunnel?: TunnelHandle;
   private dashChat?: string;
+  private auqPending = new Map<string, PendingAuq>();
 
   constructor(
     private cfg: Config,
@@ -171,6 +205,12 @@ export class Bridge {
       return { decision: 'allow', reason: '会话未进审批池，回落终端原生权限' };
     }
 
+    // 3.6) AskUserQuestion（tmux 交互会话）：放行 + 选项卡片，点击后 send-keys 真实作答
+    if (tool === 'AskUserQuestion') {
+      const r = await this.handleAskUserQuestion(payload, chatId);
+      if (r) return r; // null = 多题/找不到 tmux 会话等，回落普通审批卡
+    }
+
     // 4) 找通知目标聊天
     if (!chatId) {
       console.warn(`[bridge] 无可用飞书会话，按 on_timeout=${this.cfg.onTimeout} 处理 ${tool}`);
@@ -219,6 +259,126 @@ export class Bridge {
   private timeoutDecision(reason: string): HookResponse {
     if (this.cfg.onTimeout === 'allow') return { decision: 'allow', reason };
     return { decision: 'deny', reason: `飞书审批超时：${reason}` };
+  }
+
+  // ================================================================
+  // AskUserQuestion：放行 hook 让 TUI 出题，飞书选项卡片 → send-keys 作答
+  // （仅支持单题；多题/找不到 tmux 会话返回 null 回落普通审批卡）
+  // ================================================================
+  private async handleAskUserQuestion(payload: Record<string, unknown>, chatId: string | null): Promise<HookResponse | null> {
+    const questions = parseAuqQuestions(payload.tool_input);
+    if (questions.length !== 1) return null;
+
+    const cwd = String(payload.cwd ?? '');
+    const sess = (await listKimiSessions()).find((s) => {
+      try {
+        return path.resolve(s.cwd) === path.resolve(cwd);
+      } catch {
+        return false;
+      }
+    });
+    if (!sess) return null;
+
+    if (!chatId) return { decision: 'allow', reason: '提问在终端等待，无聊天可通知' };
+
+    const reqId = crypto.randomBytes(6).toString('hex');
+    const pending: PendingAuq = { chatId, tmuxTarget: sess.target, question: questions[0], sel: new Set() };
+    this.auqPending.set(reqId, pending);
+    setTimeout(() => this.auqPending.delete(reqId), 30 * 60_000).unref(); // 防泄漏
+
+    pending.messageId = await this.channel.sendCard(chatId, this.auqCard(reqId, pending));
+    if (!pending.messageId) {
+      this.auqPending.delete(reqId);
+      return { decision: 'allow', reason: '提问在终端等待（卡片发送失败）' };
+    }
+    this.dashboardBus.publish(chatId, 'progress', `❓ 模型提问：${truncate(questions[0].question, 150)}`);
+    return { decision: 'allow', reason: '问题已转飞书卡片，等待用户作答' };
+  }
+
+  private auqCard(reqId: string, p: PendingAuq): Record<string, unknown> {
+    const q = p.question;
+    const btns: Array<Record<string, unknown>> = q.options.map((opt, i) => ({
+      tag: 'button',
+      text: { tag: 'plain_text', content: truncate(p.sel.has(i) ? `✅ ${opt}` : opt, 30) },
+      type: p.sel.has(i) ? 'primary' : 'default',
+      value: { kcf: 'auq', req_id: reqId, a: i },
+    }));
+    if (q.multi) {
+      btns.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: '✔️ 确认选择' },
+        type: 'primary',
+        value: { kcf: 'auq', req_id: reqId, a: '__confirm__' },
+      });
+    }
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { template: 'blue', title: { tag: 'plain_text', content: '❓ Kimi Code 等待你的回答' } },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: `**${truncate(q.question, 400)}**${q.header ? `\n${q.header}` : ''}${q.multi ? '\n（多选，选完点确认）' : ''}` } },
+        { tag: 'action', actions: btns },
+        {
+          tag: 'action',
+          actions: [{ tag: 'button', text: { tag: 'plain_text', content: '🚫 拒绝回答' }, type: 'danger', value: { kcf: 'auq', req_id: reqId, d: 'deny' } }],
+        },
+        { tag: 'note', elements: [{ tag: 'plain_text', content: '点击后注入终端真实作答；自定义答案请用 /t 直接输入' }] },
+        ...this.dashNote(),
+      ],
+    };
+  }
+
+  private auqResultCard(text: string, ok: boolean): Record<string, unknown> {
+    return {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { template: ok ? 'green' : 'red', title: { tag: 'plain_text', content: `❓ 提问 ${text}` } },
+      elements: [{ tag: 'div', text: { tag: 'lark_md', content: truncate(text, 800) } }],
+    };
+  }
+
+  /** 处理答题卡点击：同步算出结果卡片内联返回；tmux 注入 fire-and-forget。 */
+  private handleAuqClick(value: Record<string, unknown>, operator: string): Record<string, unknown> | null {
+    const reqId = String(value.req_id ?? '');
+    const p = this.auqPending.get(reqId);
+    if (!p) {
+      console.info(`[bridge] 提问 ${reqId} 已作答或不存在（重复点击）`);
+      return null;
+    }
+    const send = (keys: string[]): void => {
+      sendTmuxKeys(p.tmuxTarget, keys)
+        .then(() => this.dashboardBus.publish(p.chatId, 'progress', `⌨️ 提问作答注入：${keys.join(' ')}`))
+        .catch((err) => console.error('[bridge] 提问作答注入失败:', err));
+    };
+
+    if (String(value.d ?? '') === 'deny') {
+      this.auqPending.delete(reqId);
+      send(['Escape']); // TUI 里 Esc = 拒绝
+      return this.auqResultCard('🚫 已拒绝（模型将自行决定）', false);
+    }
+
+    const q = p.question;
+    // 确认（多选）：注入各选项数字键 + Enter
+    if (String(value.a ?? '') === '__confirm__') {
+      if (!p.sel.size) return null;
+      const picks = [...p.sel].sort();
+      this.auqPending.delete(reqId);
+      send([...picks.map((i) => String(i + 1)), 'Enter']);
+      return this.auqResultCard(`✅ 已作答：${picks.map((i) => q.options[i]).join('、')}（${operator}）`, true);
+    }
+
+    const idx = Number(value.a);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= q.options.length) return null;
+
+    if (q.multi) {
+      // 多选：切换选中并刷新卡片
+      if (p.sel.has(idx)) p.sel.delete(idx);
+      else p.sel.add(idx);
+      return this.auqCard(reqId, p);
+    }
+
+    // 单选：数字键直接选中（TUI 数字键即确认，不再补 Enter 避免误发空消息）
+    this.auqPending.delete(reqId);
+    send([String(idx + 1)]);
+    return this.auqResultCard(`✅ 已作答：${q.options[idx]}（${operator}）`, true);
   }
 
   /** dashboard 开启中 → 卡片底部附当前链接；未开启 → 提示 /dashboard 命令。 */
@@ -580,10 +740,14 @@ export class Bridge {
    * 飞书才会立即在点击者的所有设备上同步更新卡片（PATCH API 不保证跨端同步）。
    */
   onCardAction(value: Record<string, unknown>, operator: string): Record<string, unknown> | null {
-    if (String(value.kcf ?? '') !== 'approval') return null;
+    const kind = String(value.kcf ?? '');
+    if (kind !== 'approval' && kind !== 'auq') return null;
     if (!this.cfg.allowedUserIds.includes(operator)) {
       console.warn(`[bridge] 非白名单用户 ${operator} 尝试操作审批卡片`);
       return null;
+    }
+    if (kind === 'auq') {
+      return this.handleAuqClick(value, operator);
     }
     const decision = String(value.d ?? '') as 'allow' | 'deny' | 'allow_session';
     const ap = this.approvals.decide(String(value.req_id ?? ''), decision, operator);

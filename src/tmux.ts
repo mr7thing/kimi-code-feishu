@@ -46,6 +46,11 @@ export async function sendTmuxText(target: string, text: string): Promise<void> 
   await run('tmux', ['send-keys', '-t', target, 'Enter']);
 }
 
+/** 原始按键注入（数字键/方向键/Escape 等，每个元素一次 send-keys 动作）。 */
+export async function sendTmuxKeys(target: string, keys: string[]): Promise<void> {
+  for (const k of keys) await run('tmux', ['send-keys', '-t', target, k]);
+}
+
 /** 抓取窗格最近 lines 行画面（纯文本）。 */
 export async function captureTmux(target: string, lines = 30): Promise<string> {
   const { stdout } = await run('tmux', ['capture-pane', '-p', '-t', target, '-S', `-${lines}`]);
