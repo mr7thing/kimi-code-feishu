@@ -164,8 +164,14 @@ export class Bridge {
     // 3) 用户之前点过"本会话允许"
     if (this.approvals.isSessionAllowed(sessionId, tool)) return { decision: 'allow', reason: 'session_allowed' };
 
-    // 4) 找通知目标聊天
+    // 3.5) 终端会话未进审批池 → 放行回落终端原生权限（桥自己派的任务除外）
     const chatId = this.routeChat(payload);
+    const isBridgeTask = chatId ? this.runner.isBusy(chatId) : false;
+    if (!isBridgeTask && !this.state.inPool(String(payload.cwd ?? ''))) {
+      return { decision: 'allow', reason: '会话未进审批池，回落终端原生权限' };
+    }
+
+    // 4) 找通知目标聊天
     if (!chatId) {
       console.warn(`[bridge] 无可用飞书会话，按 on_timeout=${this.cfg.onTimeout} 处理 ${tool}`);
       return this.timeoutDecision('尚未有任何飞书聊天与桥绑定（先给机器人发条消息）');
@@ -286,6 +292,21 @@ export class Bridge {
     const tool = String(payload.tool_name ?? '');
     const key = sessionId || cwd || 'default';
     const ev = event.toLowerCase();
+
+    // 终端会话进入权限等待（未进池）：被动通知兜底，提醒加池或 /t 作答
+    if (ev === 'permissionrequest') {
+      if (!this.state.inPool(String(cwd ?? ''))) {
+        await this.channel.sendText(
+          chatId,
+          `⚠️ 终端会话等待权限确认：\`${tool}\`\n/c 加池后走审批卡；/a 绑定后 /s 查看画面，/t 直接作答`,
+        );
+        this.dashboardBus.publish(chatId, 'progress', `⚠️ 终端等待权限：${tool}`);
+      }
+      return;
+    }
+
+    // 未进审批池的终端会话不转发进度
+    if (!this.state.inPool(String(cwd ?? ''))) return;
 
     if (ev === 'posttooluse') {
       this.progressLine(key, chatId, `🔧 \`${tool}\` ✅`);
@@ -432,6 +453,26 @@ export class Bridge {
         '🖥 终端会话（/a 序号 绑定）：\n' +
           sessions.map((s, i) => `${i + 1}. ${s.name}  \`${s.cwd}\`${s.target === cur ? '  ← 当前绑定' : ''}`).join('\n'),
       );
+    } else if (cmd === '/c') {
+      const sessions = await listKimiSessions();
+      if (arg) {
+        let cwd = arg;
+        const n = Number(arg);
+        if (Number.isInteger(n) && n >= 1 && n <= sessions.length) cwd = sessions[n - 1].cwd;
+        const inPool = this.state.togglePool(cwd);
+        await this.channel.sendText(chatId, `${inPool ? '✅ 已加入' : '❌ 已移出'}审批池：\`${cwd}\``);
+        return;
+      }
+      const pool = this.state.getPool();
+      const lines = sessions.map((s, i) => `${this.state.inPool(s.cwd) ? '✅' : '❌'} ${i + 1}. ${s.name}  \`${s.cwd}\``);
+      const extra = pool.filter((p) => !sessions.some((s) => s.cwd === p));
+      await this.channel.sendText(
+        chatId,
+        '🗂 审批池（进池的终端会话才弹审批卡/推进度）：\n' +
+          (lines.join('\n') || '（未发现 tmux 会话）') +
+          (extra.length ? `\n池内其他目录：${extra.map((p) => `\`${p}\``).join(' ')}` : '') +
+          '\n/c 序号 或 /c 路径 切换',
+      );
     } else if (cmd === '/t') {
       const target = this.state.getAttach(chatId);
       if (!target) {
@@ -576,6 +617,7 @@ export const HELP_TEXT = `🤖 kimi-code-feishu 使用指南
 /a            列出终端 tmux 会话；/a 序号 绑定到本聊天
 /t <文本>     向绑定会话注入文本+回车（空文本=只回车）
 /s            查看绑定会话当前画面
+/c            审批池列表；/c 序号或路径 切换（进池的终端会话才弹审批卡）
 /id           查看你的 open_id
 /help         本帮助
 

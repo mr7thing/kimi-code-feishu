@@ -21,6 +21,7 @@ const PROGRESS_EVENTS = [
   'SessionStart', 'SessionEnd',
   'SubagentStart', 'SubagentStop',
   'Interrupt',
+  'PermissionRequest',
 ];
 
 export function detectKimiConfig(): string {
@@ -70,7 +71,7 @@ export function install(configPath?: string, approvalTimeout = 150, cfgPath?: st
   const target = configPath ?? detectKimiConfig();
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const original = fs.existsSync(target) ? fs.readFileSync(target, 'utf-8') : '';
-  if (original.includes(BEGIN)) {
+  if (hasOurHooks(original)) {
     throw new Error(`${target} 中已存在 kimi-code-feishu 的 hooks，请先 uninstall`);
   }
   if (original) {
@@ -81,19 +82,36 @@ export function install(configPath?: string, approvalTimeout = 150, cfgPath?: st
   return target;
 }
 
+/** 检测是否已注入我们的 hooks：标记块存在，或任何 [[hooks]] 指向本包 hook.js（标记可能被 CLI 重写配置时剥掉）。 */
+function hasOurHooks(text: string): boolean {
+  return text.includes(BEGIN) || text.includes(hookJsPath());
+}
+
 export function uninstall(configPath?: string): string {
   const target = configPath ?? detectKimiConfig();
   if (!fs.existsSync(target)) throw new Error(`配置文件不存在: ${target}`);
   const text = fs.readFileSync(target, 'utf-8');
-  if (!text.includes(BEGIN)) throw new Error(`${target} 中没有 kimi-code-feishu 的 hooks`);
+  if (!hasOurHooks(text)) throw new Error(`${target} 中没有 kimi-code-feishu 的 hooks`);
   fs.copyFileSync(target, target.replace(/\.toml$/, '') + `.toml.bak-${timestamp()}`);
-  const start = text.indexOf(BEGIN);
-  const stop = text.indexOf(END) + END.length;
-  fs.writeFileSync(target, (text.slice(0, start) + text.slice(stop)).trim() + '\n', 'utf-8');
+  let out: string;
+  if (text.includes(BEGIN)) {
+    const start = text.indexOf(BEGIN);
+    const stop = text.indexOf(END) + END.length;
+    out = (text.slice(0, start) + text.slice(stop)).trim() + '\n';
+  } else {
+    // 标记丢失：按 [[hooks]] 节移除命令指向本包 hook.js 的块
+    const hookJs = hookJsPath();
+    out = text
+      .split(/(?=\[\[hooks\]\])/g)
+      .filter((s) => !s.startsWith('[[hooks]]') || !s.includes(hookJs))
+      .join('')
+      .trim() + '\n';
+  }
+  fs.writeFileSync(target, out, 'utf-8');
   return target;
 }
 
 export function isInstalled(configPath?: string): boolean {
   const target = configPath ?? detectKimiConfig();
-  return fs.existsSync(target) && fs.readFileSync(target, 'utf-8').includes(BEGIN);
+  return fs.existsSync(target) && hasOurHooks(fs.readFileSync(target, 'utf-8'));
 }

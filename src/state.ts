@@ -16,6 +16,8 @@ interface StateData {
   chats: Record<string, ChatInfo>;
   session_routes: Record<string, string>;
   default_notify_chat: string | null;
+  /** 审批池：进池的目录（cwd）对应的终端会话才弹审批卡/推进度 */
+  approval_pool: string[];
 }
 
 export class StateStore {
@@ -24,7 +26,7 @@ export class StateStore {
 
   constructor(file?: string) {
     this.file = file ?? path.join(DEFAULT_CONFIG_DIR, 'state.json');
-    this.data = { chats: {}, session_routes: {}, default_notify_chat: null };
+    this.data = { chats: {}, session_routes: {}, default_notify_chat: null, approval_pool: [] };
     if (fs.existsSync(this.file)) {
       try {
         Object.assign(this.data, JSON.parse(fs.readFileSync(this.file, 'utf-8')));
@@ -78,6 +80,31 @@ export class StateStore {
 
   defaultNotifyChat(): string | null {
     return this.data.default_notify_chat;
+  }
+
+  // ---- 审批池（按目录） ----
+  getPool(): string[] {
+    return [...this.data.approval_pool];
+  }
+
+  inPool(cwd?: string): boolean {
+    if (!cwd) return false;
+    const norm = path.resolve(cwd);
+    return this.data.approval_pool.some((p) => path.resolve(p) === norm);
+  }
+
+  /** 切换池状态，返回切换后是否在池。 */
+  togglePool(cwd: string): boolean {
+    const norm = path.resolve(cwd);
+    const i = this.data.approval_pool.findIndex((p) => path.resolve(p) === norm);
+    if (i >= 0) {
+      this.data.approval_pool.splice(i, 1);
+      this.save();
+      return false;
+    }
+    this.data.approval_pool.push(norm);
+    this.save();
+    return true;
   }
 
   // ---- session_id / cwd → chat 路由 ----

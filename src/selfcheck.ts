@@ -171,7 +171,7 @@ async function main(): Promise<void> {
     check('安装器: hook 命令指向本包 hook.js', text.includes('hook.js pre_tool_use'));
     // 回归：写出的必须是合法 TOML，且转义后命令里的 KCF_CONFIG 保持完整
     const parsed = parseToml(text) as { hooks?: Array<{ command?: string }> };
-    check('安装器: 生成的 TOML 可解析', Array.isArray(parsed.hooks) && parsed.hooks.length === 10);
+    check('安装器: 生成的 TOML 可解析', Array.isArray(parsed.hooks) && parsed.hooks.length === 11);
     check('安装器: 解析后 KCF_CONFIG 完整', (parsed.hooks?.[0]?.command ?? '').includes('KCF_CONFIG="/tmp/x/config.toml"'));
     let threw = false;
     try { installer.install(kimiCfg); } catch { threw = true; }
@@ -210,6 +210,22 @@ async function main(): Promise<void> {
       session_id: 's1', cwd: tmp, tool_name: 'ReadMediaFile', tool_input: { path: '/tmp/a.png' },
     });
     check('端到端: ReadMediaFile 自动放行（真实工具名）', r.stdout.trim() === '' && r.code === 0);
+
+    // 5.2b 审批池：未进池的终端会话直接放行、不弹卡、不转发进度
+    r = await runHook(cfgPath, 'pre_tool_use', {
+      session_id: 's-term', cwd: tmp, tool_name: 'Shell', tool_input: { command: 'make build' },
+    });
+    check('审批池: 未进池终端会话放行不弹卡', r.stdout.trim() === '' && channel.cards().length === 0);
+    const textsBefore = channel.texts().length;
+    await runHook(cfgPath, 'posttooluse', { session_id: 's-term', cwd: tmp, tool_name: 'Shell' });
+    await sleep(300);
+    check('审批池: 未进池不转发进度', channel.texts().length === textsBefore);
+    await runHook(cfgPath, 'permissionrequest', { session_id: 's-term', cwd: tmp, tool_name: 'Shell' });
+    await sleep(300);
+    check('审批池: PermissionRequest 被动通知', channel.texts().some((t) => t.includes('等待权限')));
+
+    // 进池后恢复卡片/进度语义
+    state.togglePool(tmp);
 
     // 5.3 需审批工具：发卡片 → 模拟用户在飞书点"批准"
     let returnedCard: Record<string, unknown> | null = null;
@@ -292,6 +308,12 @@ async function main(): Promise<void> {
     check('命令: /bind 生效', state.getWorkDir('chat-1', '') === '/tmp');
     await bridge.onFeishuMessage('chat-1', 'ou_boss', '/status');
     check('命令: /status 有响应', channel.texts().some((t) => t.includes('状态')));
+
+    // 5.7b 审批池命令
+    await bridge.onFeishuMessage('chat-1', 'ou_boss', '/c');
+    check('命令: /c 列出审批池', channel.texts().some((t) => t.includes('审批池')));
+    await bridge.onFeishuMessage('chat-1', 'ou_boss', '/c /somewhere-else');
+    check('命令: /c 路径切换进池', state.inPool('/somewhere-else'));
 
     // 5.8 Interrupt 事件 → 飞书通知
     await runHook(cfgPath, 'interrupt', { session_id: 's9', cwd: tmp });
