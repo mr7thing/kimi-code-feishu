@@ -9,6 +9,7 @@
 import type { Approval, ApprovalManager as AM } from './approvals.js';
 import { ApprovalManager } from './approvals.js';
 import type { Channel } from './channel.js';
+import { ChatLogger, type LogDir } from './chatLogger.js';
 import type { Config } from './config.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -108,6 +109,7 @@ export class Bridge {
   private taskStatus = new Map<string, { text?: string; tool?: string; lastPush: number }>();
   /** dashboard 事件总线（始终存在）；HTTP 服务按需开启 */
   private dashboardBus = new Dashboard();
+  private logger: ChatLogger;
   private dashServer?: DashboardServer;
   private dashToken?: string;
   private dashPublic?: string;
@@ -121,7 +123,19 @@ export class Bridge {
     channel?: Channel,
   ) {
     if (channel) this.channel = channel;
-    this.runner = new KimiRunner(cfg, state, this, (chatId, kind, text) => this.dashboardBus.publish(chatId, kind, text));
+    this.logger = new ChatLogger(cfg.logDir || undefined);
+    this.runner = new KimiRunner(cfg, state, this, (chatId, kind, text) => this.publish(chatId, kind, text));
+  }
+
+  /** 日志（log_enabled 时生效；绝不抛错影响主流程）。 */
+  log(chatId: string, dir: LogDir, kind: string, text: string): void {
+    if (this.cfg.logEnabled) this.logger.log(chatId, dir, kind, text);
+  }
+
+  /** 总线事件统一出口：日志 + dashboard。 */
+  private publish(chatId: string, kind: Parameters<Dashboard['publish']>[1], text: string): void {
+    this.log(chatId, 'sys', kind, text);
+    this.dashboardBus.publish(chatId, kind, text);
   }
 
   // ================================================================
@@ -234,7 +248,7 @@ export class Bridge {
       console.error('[bridge] 发送审批卡片失败:', err);
     }
     if (!ap.messageId) return this.timeoutDecision('审批卡片发送失败');
-    this.dashboardBus.publish(chatId, 'progress', `🔐 审批请求：${tool} — ${truncate(summary, 200)}`);
+    this.publish(chatId, 'progress', `🔐 审批请求：${tool} — ${truncate(summary, 200)}`);
 
     const result = await this.approvals.wait(ap, this.cfg.approvalTimeout * 1000);
     return this.resolve(ap, result.decision, result.operator);
@@ -260,7 +274,7 @@ export class Bridge {
         console.error('[bridge] 更新审批卡片失败:', err);
       }
     }
-    if (ap.chatId) this.dashboardBus.publish(ap.chatId, 'progress', `${decidedText}：${ap.toolName}${operator ? `（${operator}）` : ''}`);
+    if (ap.chatId) this.publish(ap.chatId, 'progress', `${decidedText}：${ap.toolName}${operator ? `（${operator}）` : ''}`);
     return resp;
   }
 
@@ -300,7 +314,7 @@ export class Bridge {
       this.auqPending.delete(reqId);
       return { decision: 'allow', reason: '提问在终端等待（卡片发送失败）' };
     }
-    this.dashboardBus.publish(chatId, 'progress', `❓ 模型提问：${truncate(questions[0].question, 150)}`);
+    this.publish(chatId, 'progress', `❓ 模型提问：${truncate(questions[0].question, 150)}`);
     return { decision: 'allow', reason: '问题已转飞书卡片，等待用户作答' };
   }
 
@@ -355,7 +369,7 @@ export class Bridge {
     const send = (keys: string[]): void => {
       const job = p.kind === 'pts' ? sendPtsKeys(p.tmuxTarget, keys) : sendTmuxKeys(p.tmuxTarget, keys);
       job
-        .then(() => this.dashboardBus.publish(p.chatId, 'progress', `⌨️ 提问作答注入：${keys.join(' ')}`))
+        .then(() => this.publish(p.chatId, 'progress', `⌨️ 提问作答注入：${keys.join(' ')}`))
         .catch((err) => console.error('[bridge] 提问作答注入失败:', err));
     };
 
@@ -470,7 +484,7 @@ export class Bridge {
           chatId,
           `⚠️ 终端会话等待权限确认：\`${tool}\`\n/c 加池后走审批卡；/a 绑定后 /s 查看画面，/t 直接作答`,
         );
-        this.dashboardBus.publish(chatId, 'progress', `⚠️ 终端等待权限：${tool}`);
+        this.publish(chatId, 'progress', `⚠️ 终端等待权限：${tool}`);
       }
       return;
     }
@@ -489,23 +503,23 @@ export class Bridge {
     } else if (ev === 'stop') {
       await this.progressFlush(key, true);
       await this.channel.sendText(chatId, '✅ 本轮任务结束');
-      this.dashboardBus.publish(chatId, 'progress', '✅ 本轮任务结束');
+      this.publish(chatId, 'progress', '✅ 本轮任务结束');
     } else if (ev === 'stopfailure') {
       await this.progressFlush(key, true);
       await this.channel.sendText(chatId, `⚠️ 本轮出错结束：${truncate(String(payload.error_message ?? ''), 200)}`);
-      this.dashboardBus.publish(chatId, 'progress', `⚠️ 本轮出错结束：${truncate(String(payload.error_message ?? ''), 200)}`);
+      this.publish(chatId, 'progress', `⚠️ 本轮出错结束：${truncate(String(payload.error_message ?? ''), 200)}`);
     } else if (ev === 'interrupt') {
       await this.progressFlush(key, true);
       await this.channel.sendText(chatId, '⛔ 本轮被用户中断');
-      this.dashboardBus.publish(chatId, 'progress', '⛔ 本轮被用户中断');
+      this.publish(chatId, 'progress', '⛔ 本轮被用户中断');
     } else if (ev === 'sessionstart') {
       await this.channel.sendText(chatId, `🚀 新会话开始（${payload.source ?? ''}）：${sessionId.slice(0, 12)}`);
-      this.dashboardBus.publish(chatId, 'progress', `🚀 新会话开始：${sessionId.slice(0, 12)}`);
+      this.publish(chatId, 'progress', `🚀 新会话开始：${sessionId.slice(0, 12)}`);
     }
   }
 
   private progressLine(key: string, chatId: string, line: string): void {
-    this.dashboardBus.publish(chatId, 'progress', line);
+    this.publish(chatId, 'progress', line);
     let p = this.progress.get(key);
     if (!p) {
       p = { lines: [], lastUpdate: 0, chatId };
@@ -539,6 +553,7 @@ export class Bridge {
   // ================================================================
   async onFeishuMessage(chatId: string, openId: string, text: string): Promise<void> {
     this.state.touchChat(chatId);
+    this.log(chatId, 'in', 'text', `${openId}: ${text}`);
 
     // /id 对所有人开放（方便首次配置白名单）
     if (text.trim() === '/id') {
@@ -668,7 +683,7 @@ export class Bridge {
         }
         try {
           await sendPtsText(pane, arg);
-          this.dashboardBus.publish(chatId, 'progress', `⌨️ /t 注入(pts)：${truncate(arg || '(回车)', 120)}`);
+          this.publish(chatId, 'progress', `⌨️ /t 注入(pts)：${truncate(arg || '(回车)', 120)}`);
         } catch {
           await this.channel.sendText(chatId, '❌ 注入失败（终端可能已关闭），/a 重新选择');
         }
@@ -676,7 +691,7 @@ export class Bridge {
       }
       try {
         await sendTmuxText(pane, arg);
-        this.dashboardBus.publish(chatId, 'progress', `⌨️ /t 注入：${truncate(arg || '(回车)', 120)}`);
+        this.publish(chatId, 'progress', `⌨️ /t 注入：${truncate(arg || '(回车)', 120)}`);
       } catch {
         await this.channel.sendText(chatId, '❌ 注入失败（会话可能已退出），/a 重新选择');
       }
@@ -784,10 +799,13 @@ export class Bridge {
     if (kind !== 'approval' && kind !== 'auq') return null;
     if (!this.cfg.allowedUserIds.includes(operator)) {
       console.warn(`[bridge] 非白名单用户 ${operator} 尝试操作审批卡片`);
+      this.log('-', 'in', 'action_denied', `${operator}: ${JSON.stringify(value).slice(0, 300)}`);
       return null;
     }
     if (kind === 'auq') {
-      return this.handleAuqClick(value, operator);
+      const card = this.handleAuqClick(value, operator);
+      this.log('-', 'in', 'action', `${operator} auq: ${JSON.stringify(value).slice(0, 300)}`);
+      return card;
     }
     const decision = String(value.d ?? '') as 'allow' | 'deny' | 'allow_session';
     const ap = this.approvals.decide(String(value.req_id ?? ''), decision, operator);
@@ -795,6 +813,7 @@ export class Bridge {
       console.info(`[bridge] 审批 ${value.req_id} 已处理或不存在（可能超时/重复点击）`);
       return null;
     }
+    this.log(ap.chatId ?? '-', 'in', 'action', `${operator} ${decision}: ${ap.toolName}`);
     return this.approvalResultCard(ap, decidedTextFor(decision) ?? '❌ 已拒绝', operator);
   }
 

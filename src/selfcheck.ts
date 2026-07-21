@@ -15,6 +15,7 @@ import { ApprovalManager } from './approvals.js';
 import { pollAppRegistration, RegistrationError, requestAppRegistration } from './appRegistration.js';
 import { Bridge, toolInputSummary } from './bridge.js';
 import { loadConfig, saveConfig } from './config.js';
+import { ChatLogger, LoggingChannel } from './chatLogger.js';
 import { Dashboard, serveDashboard } from './dashboard.js';
 import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
@@ -622,6 +623,38 @@ while time.time() < end:
         await execFileP('tmux', ['kill-session', '-t', sess]).catch(() => {});
       }
     }
+  }
+
+  // ---------------------------------------------------------------- 11. 对话日志
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kcf-log-'));
+    const logger = new ChatLogger(tmp);
+    const day = new Date().toISOString().slice(0, 10);
+    const logFile = path.join(tmp, `${day}.jsonl`);
+
+    logger.log('chat-1', 'in', 'text', 'ou_x: 你好');
+    const e = JSON.parse(fs.readFileSync(logFile, 'utf-8').trim().split('\n')[0]);
+    check('日志: 写入 JSONL 条目', e.chat === 'chat-1' && e.dir === 'in' && e.text.includes('你好'));
+
+    const fake = new FakeChannel();
+    const lc = new LoggingChannel(fake, logger);
+    await lc.sendText('chat-1', '回复内容-xyz');
+    check('日志: 出站消息透传且记录',
+      fake.texts().includes('回复内容-xyz') && fs.readFileSync(logFile, 'utf-8').includes('回复内容-xyz'));
+
+    fs.writeFileSync(path.join(tmp, '2020-01-01.jsonl'), '{}\n');
+    check('日志: clean 清理过期文件', logger.clean(30) === 1 && !fs.existsSync(path.join(tmp, '2020-01-01.jsonl')));
+
+    // e2e：桥入站消息落盘
+    const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'kcf-loge2e-'));
+    const cfg = loadConfig(makeConfig(tmp2, await freePort()));
+    cfg.logDir = path.join(tmp2, 'logs');
+    const state = new StateStore(path.join(tmp2, 'state.json'));
+    const channel = new FakeChannel();
+    const bridge = new Bridge(cfg, state, channel);
+    await bridge.onFeishuMessage('chat-9', 'ou_boss', '/id');
+    const logFile2 = path.join(tmp2, 'logs', `${day}.jsonl`);
+    check('日志: 桥入站消息落盘', fs.existsSync(logFile2) && fs.readFileSync(logFile2, 'utf-8').includes('/id'));
   }
 
   // ---------------------------------------------------------------- 汇总
