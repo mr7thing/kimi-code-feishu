@@ -12,8 +12,9 @@ fi
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/kimi-code-feishu.service"
 mkdir -p "$UNIT_DIR"
-sed "s|__BIN__|$BIN|" "$(dirname "$0")/kimi-code-feishu.service" > "$UNIT"
-echo "已写入 $UNIT（ExecStart=$BIN run）"
+# __FULL_PATH__ = 安装时的完整交互 PATH（含 nvm、~/.kimi-code/bin 等，桥 spawn kimi 需要）
+sed -e "s|__BIN__|$BIN|" -e "s|__FULL_PATH__|$PATH|" "$(dirname "$0")/kimi-code-feishu.service" > "$UNIT"
+echo "已写入 $UNIT（ExecStart=$BIN run，已带入当前 PATH）"
 
 systemctl --user daemon-reload
 systemctl --user enable --now kimi-code-feishu.service

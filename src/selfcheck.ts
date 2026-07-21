@@ -78,6 +78,7 @@ approval_timeout = 10
 on_timeout = "deny"
 fail_closed = true
 kimi_bin = "kimi"
+log_dir = "${tmp.replace(/\\/g, '\\\\')}/logs"
 `, 'utf-8');
   return p;
 }

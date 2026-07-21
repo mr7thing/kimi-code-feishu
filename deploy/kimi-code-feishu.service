@@ -7,6 +7,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# PATH 用安装时的完整交互 PATH（nvm、~/.kimi-code/bin 等），否则桥 spawn kimi 会 ENOENT
+Environment=PATH=__FULL_PATH__
 ExecStart=__BIN__ run
 Restart=always
 RestartSec=5

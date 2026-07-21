@@ -241,8 +241,22 @@ function append(ev) {
 }
 
 const es = new EventSource('/events?token=' + encodeURIComponent(token));
-es.onopen = () => dot.classList.add('on');
-es.onerror = () => dot.classList.remove('on');
+es.onopen = () => {
+  dot.classList.add('on');
+  const b = document.getElementById('banner');
+  if (b) b.remove();
+};
+es.onerror = () => {
+  dot.classList.remove('on');
+  // SSE 断开（dashboard 已关闭/网络中断）时明确提示，而不是装死空白页
+  if (!document.getElementById('banner')) {
+    const b = document.createElement('div');
+    b.id = 'banner';
+    b.style.cssText = 'position:sticky;top:0;background:#5a1d1d;color:#ffd7d7;padding:10px 12px;font-weight:bold;z-index:9';
+    b.textContent = '⚠️ 连接已断开：Dashboard 已关闭或网络中断（可在飞书发 /dashboard 重新开启）';
+    document.body.insertBefore(b, log);
+  }
+};
 es.onmessage = (m) => { try { append(JSON.parse(m.data)); } catch {} };
 
 // 心跳保活：页面可见时每 30s 一次；无心跳超过闲置阈值服务端自动关闭
