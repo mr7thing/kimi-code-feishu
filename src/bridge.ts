@@ -482,7 +482,7 @@ export class Bridge {
       if (!this.state.inPool(String(cwd ?? ''))) {
         await this.channel.sendText(
           chatId,
-          `⚠️ 终端会话等待权限确认：\`${tool}\`\n/c 加池后走审批卡；/a 绑定后 /s 查看画面，/t 直接作答`,
+          `⚠️ 终端会话等待权限确认：\`${tool}\`\n/c 加池后走审批卡；/a 绑定后 /t 直接作答`,
         );
         this.publish(chatId, 'progress', `⚠️ 终端等待权限：${tool}`);
       }
@@ -625,11 +625,13 @@ export class Bridge {
         }
         const s = sessions[n - 1];
         this.state.setAttach(chatId, `${s.kind}|${s.target}`);
-        await this.channel.sendText(
-          chatId,
-          `🔗 已绑定：${s.name}\n目录：\`${s.cwd}\`` +
-            (s.injectable ? '\n/t <文本> 注入回车，/s 查看画面' : '\n⚠️ 该会话不在 tmux，无法注入/抓屏（用 kimi-code-feishu tmux 重启可管控）'),
-        );
+        const hint =
+          s.kind === 'tmux'
+            ? '\n/t <文本> 注入回车，/s 查看画面'
+            : s.injectable
+              ? '\n/t 可注入；pts 终端无法抓屏（/s 仅 tmux 会话可用）'
+              : '\n⚠️ 该会话不在 tmux，无法注入/抓屏（用 kimi-code-feishu tmux 重启可管控）';
+        await this.channel.sendText(chatId, `🔗 已绑定：${s.name}\n目录：\`${s.cwd}\`${hint}`);
         return;
       }
       if (!sessions.length) {
@@ -642,12 +644,12 @@ export class Bridge {
         '🖥 终端会话（/a 序号 绑定）：\n' +
           sessions
             .map((s, i) => {
-              const tag = s.injectable ? '⌨️可控' : '👀仅发现';
+              const tag = s.kind === 'tmux' ? '⌨️可控' : s.injectable ? '⌨️仅注入' : '👀仅发现';
               const bound = `${s.kind}|${s.target}` === cur ? '  ← 当前绑定' : '';
               return `${i + 1}. [${tag}] ${s.name}  \`${s.cwd}\`${bound}`;
             })
             .join('\n') +
-          '\n⌨️可控=tmux 会话或 pts 注入可用；👀仅发现=无法注入（审批卡正常）',
+          '\n⌨️可控=tmux（可注入+抓屏）；⌨️仅注入=pts（可注入，无抓屏）；👀仅发现=无法注入',
       );
     } else if (cmd === '/c') {
       const sessions = await listKimiSessions();
@@ -703,7 +705,7 @@ export class Bridge {
       }
       const { kind, target: pane } = parseAttach(target);
       if (kind !== 'tmux') {
-        await this.channel.sendText(chatId, '⚠️ 绑定的会话不在 tmux，无法抓屏。可用 /dashboard 看实时输出');
+        await this.channel.sendText(chatId, '⚠️ pts 终端无法抓屏（pts 只写不读，原理限制，不是故障）；tmux 会话才支持 /s');
         return;
       }
       try {

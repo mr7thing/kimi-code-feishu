@@ -121,7 +121,8 @@ journalctl --user -u kimi-code-feishu -f   # 看日志
 `/a` 列出**所有**活着的 kimi 终端会话（`ps` 全量扫描 + 进程树匹配），分两级：
 
 - **⌨️可控（tmux）**：`kimi-code-feishu tmux` 启动的会话，`/t` send-keys 注入、`/s` capture-pane 抓屏
-- **⌨️可控（pts）/ 👀仅发现**：普通终端里的 kimi。本机已启用 `legacy_tiocsti=1` + 免密 sudo 时可注入（TIOCSTI 把按键塞进终端输入队列）；不满足时降级为仅发现——审批卡走 hook 不受影响，但无法注入/抓屏
+- **⌨️可控（tmux）**：`kimi-code-feishu tmux` 启动的会话，`/t` send-keys 注入、`/s` capture-pane 抓屏
+- **⌨️仅注入（pts）/ 👀仅发现**：普通终端里的 kimi。本机已启用 `legacy_tiocsti=1` + 免密 sudo 时可注入（TIOCSTI 把按键塞进终端输入队列）；不满足时降级为仅发现。注意 **pts 终端永远无法抓屏**（pts 只写不读，原理限制），`/s` 仅 tmux 会话可用；审批卡走 hook 不受影响
 
 ```bash
 kimi-code-feishu tmux     # 在 tmux 里启动 kimi（kcf-* 命名），Ctrl+B D 脱离
