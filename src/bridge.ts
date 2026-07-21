@@ -13,7 +13,7 @@ import { ChatLogger, type LogDir } from './chatLogger.js';
 import type { Config } from './config.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { Dashboard, serveDashboard, type DashboardServer } from './dashboard.js';
+import { Dashboard, serveDashboard, type DashboardServer, type DashKind } from './dashboard.js';
 import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
 import type { StreamEvent } from './streamParser.js';
@@ -108,8 +108,8 @@ export class Bridge {
   private taskMsgPending = new Map<string, Promise<string | undefined>>();
   private taskStatus = new Map<string, { text?: string; tool?: string; lastPush: number }>();
   /** dashboard 事件总线（始终存在）；HTTP 服务按需开启 */
-  private dashboardBus = new Dashboard();
-  private logger: ChatLogger;
+  readonly dashboardBus = new Dashboard();
+  readonly logger: ChatLogger;
   private dashServer?: DashboardServer;
   private dashToken?: string;
   private dashPublic?: string;
@@ -124,18 +124,23 @@ export class Bridge {
   ) {
     if (channel) this.channel = channel;
     this.logger = new ChatLogger(cfg.logDir || undefined);
+    this.logger.fileEnabled = cfg.logEnabled;
+    // 对话日志全量条目同时进 dashboard feed（实时对话显示）：sys 按原 kind，收/发标记 👤/🤖
+    this.logger.onEntry = (e) => {
+      const prefix = e.dir === 'in' ? '👤 ' : e.dir === 'out' ? '🤖 ' : '';
+      this.dashboardBus.publish(e.chat, e.dir === 'sys' ? (e.kind as DashKind) : e.dir, prefix + e.text);
+    };
     this.runner = new KimiRunner(cfg, state, this, (chatId, kind, text) => this.publish(chatId, kind, text));
   }
 
-  /** 日志（log_enabled 时生效；绝不抛错影响主流程）。 */
+  /** 日志（onEntry 进 dashboard；fileEnabled 时落盘；绝不抛错影响主流程）。 */
   log(chatId: string, dir: LogDir, kind: string, text: string): void {
-    if (this.cfg.logEnabled) this.logger.log(chatId, dir, kind, text);
+    this.logger.log(chatId, dir, kind, text);
   }
 
-  /** 总线事件统一出口：日志 + dashboard。 */
+  /** 总线事件统一出口：日志（钩子转发 dashboard）。 */
   private publish(chatId: string, kind: Parameters<Dashboard['publish']>[1], text: string): void {
     this.log(chatId, 'sys', kind, text);
-    this.dashboardBus.publish(chatId, kind, text);
   }
 
   // ================================================================

@@ -646,16 +646,20 @@ while time.time() < end:
     fs.writeFileSync(path.join(tmp, '2020-01-01.jsonl'), '{}\n');
     check('日志: clean 清理过期文件', logger.clean(30) === 1 && !fs.existsSync(path.join(tmp, '2020-01-01.jsonl')));
 
-    // e2e：桥入站消息落盘
+    // e2e：桥入站消息落盘 + 进 dashboard feed
     const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'kcf-loge2e-'));
     const cfg = loadConfig(makeConfig(tmp2, await freePort()));
     cfg.logDir = path.join(tmp2, 'logs');
     const state = new StateStore(path.join(tmp2, 'state.json'));
     const channel = new FakeChannel();
     const bridge = new Bridge(cfg, state, channel);
+    bridge.channel = new LoggingChannel(channel, bridge.logger);
     await bridge.onFeishuMessage('chat-9', 'ou_boss', '/id');
     const logFile2 = path.join(tmp2, 'logs', `${day}.jsonl`);
     check('日志: 桥入站消息落盘', fs.existsSync(logFile2) && fs.readFileSync(logFile2, 'utf-8').includes('/id'));
+    const feed = bridge.dashboardBus.snapshot();
+    check('日志: 入站消息进 dashboard feed', feed.some((e) => e.kind === 'in' && e.text.includes('👤') && e.text.includes('/id')));
+    check('日志: 出站回复进 dashboard feed', feed.some((e) => e.kind === 'out' && e.text.includes('🤖')));
   }
 
   // ---------------------------------------------------------------- 汇总

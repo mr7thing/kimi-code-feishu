@@ -17,7 +17,7 @@ import * as readline from 'node:readline/promises';
 import QRCode from 'qrcode';
 import { pollAppRegistration, RegistrationError, requestAppRegistration } from './appRegistration.js';
 import { Bridge } from './bridge.js';
-import { ChatLogger, LoggingChannel } from './chatLogger.js';
+import { LoggingChannel } from './chatLogger.js';
 import { loadConfig, saveConfig, saveExampleConfig } from './config.js';
 import { FeishuChannel } from './feishuChannel.js';
 import { serveHooks } from './hookServer.js';
@@ -205,9 +205,9 @@ async function cmdRun(args: string[]): Promise<number> {
     (chatId, openId, text) => void bridge.onFeishuMessage(chatId, openId, text),
     (value, operator) => bridge.onCardAction(value, operator),
   );
-  // 对话日志：出站消息经 LoggingChannel 落盘，入站由 bridge 记录
-  const logger = new ChatLogger(cfg.logDir || undefined);
-  const channel = cfg.logEnabled ? new LoggingChannel(rawChannel, logger) : rawChannel;
+  // 对话日志：出站消息经 LoggingChannel 记录（feed + 落盘由 bridge.logger 统一处理）
+  const logger = bridge.logger;
+  const channel = new LoggingChannel(rawChannel, logger);
   bridge.channel = channel;
   if (cfg.logEnabled) {
     const removed = logger.clean(cfg.logRetentionDays);

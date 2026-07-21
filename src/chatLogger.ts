@@ -22,13 +22,24 @@ export interface LogEntry {
 }
 
 export class ChatLogger {
+  /** 条目钩子（dashboard feed 订阅全量对话事件用）。 */
+  onEntry?: (e: LogEntry) => void;
+  /** false 时只触发钩子不落盘（dashboard feed 与磁盘日志解耦）。 */
+  fileEnabled = true;
+
   constructor(private dir: string = path.join(DEFAULT_CONFIG_DIR, 'logs')) {}
 
   log(chat: string, dir: LogDir, kind: string, text: string): void {
+    const entry: LogEntry = { ts: Date.now(), chat, dir, kind, text };
+    try {
+      this.onEntry?.(entry);
+    } catch {
+      /* 钩子异常不影响日志 */
+    }
+    if (!this.fileEnabled) return;
     try {
       const day = new Date().toISOString().slice(0, 10);
       fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-      const entry: LogEntry = { ts: Date.now(), chat, dir, kind, text };
       fs.appendFileSync(path.join(this.dir, `${day}.jsonl`), JSON.stringify(entry) + '\n', { mode: 0o600 });
     } catch {
       /* 日志失败不影响主流程 */

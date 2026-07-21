@@ -12,7 +12,7 @@
  */
 import http from 'node:http';
 
-export type DashKind = 'stdout' | 'stderr' | 'lifecycle' | 'progress';
+export type DashKind = 'stdout' | 'stderr' | 'lifecycle' | 'progress' | 'in' | 'out';
 
 export interface DashEvent {
   ts: number;
@@ -45,6 +45,11 @@ export class Dashboard {
 
   unsubscribe(res: http.ServerResponse): void {
     this.clients.delete(res);
+  }
+
+  /** 当前缓冲快照（测试/诊断用）。 */
+  snapshot(): DashEvent[] {
+    return [...this.buffer];
   }
 }
 
@@ -183,6 +188,8 @@ const DASHBOARD_HTML = `<!doctype html>
   .stderr .text { color: #f14c4c; }
   .lifecycle .text { color: #808080; }
   .progress .text { color: #6bcbff; }
+  .in .text { color: #b5e853; }
+  .out .text { color: #8cc8ff; }
   .hide { display: none; }
 </style>
 </head>
