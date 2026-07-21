@@ -134,14 +134,16 @@ export class KimiRunner {
     proc.on('error', (err) => {
       // spawn 失败（如 ENOENT）
       clearTimeout(watchdog);
-      this.active.delete(chatId);
+      // 只注销自己：stop+submit 后老进程的迟到事件不能误删新任务
+      if (this.active.get(chatId) === task) this.active.delete(chatId);
       this.onOutput?.(chatId, 'lifecycle', `✖ 进程错误：${String(err)}`);
       this.cb.onTaskDone(chatId, task, 127, String(err));
     });
 
     proc.on('close', (code) => {
       clearTimeout(watchdog);
-      this.active.delete(chatId);
+      // 只注销自己：stop+submit 后老进程的迟到 close 不能误删新任务
+      if (this.active.get(chatId) === task) this.active.delete(chatId);
       this.onOutput?.(chatId, 'lifecycle', `■ 任务结束，exit=${code ?? 'null'}`);
       try {
         this.cb.onTaskDone(chatId, task, code, stderrTail);
@@ -156,6 +158,7 @@ export class KimiRunner {
   stop(chatId: string): boolean {
     const task = this.active.get(chatId);
     if (!task) return false;
+    this.active.delete(chatId); // 立即注销：stop+submit 场景下允许马上重新提交
     this.kill(task);
     return true;
   }

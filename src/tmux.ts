@@ -52,6 +52,12 @@ export async function sendPtsText(tty: string, text: string): Promise<void> {
   await run('sudo', ['-n', 'python3', '-c', PTS_INJECT_PY, tty, flat + '\n']);
 }
 
+/** 向 pts 注入文本 + Ctrl+S（立即插入正在执行的轮次）。 */
+export async function sendPtsCtrlS(tty: string, text: string): Promise<void> {
+  const flat = text.replace(/\s*\n+\s*/g, ' ').trim();
+  await run('sudo', ['-n', 'python3', '-c', PTS_INJECT_PY, tty, flat + '\x13']);
+}
+
 /** 向 pts 注入按键序列：'Enter'→换行，'Escape'→ESC，其余取首字符。 */
 export async function sendPtsKeys(tty: string, keys: string[]): Promise<void> {
   const payload = keys
@@ -159,6 +165,13 @@ export async function sendTmuxText(target: string, text: string): Promise<void> 
   const flat = text.replace(/\s*\n+\s*/g, ' ').trim();
   if (flat) await run('tmux', ['send-keys', '-t', target, '-l', '--', flat]);
   await run('tmux', ['send-keys', '-t', target, 'Enter']);
+}
+
+/** 注入文本 + Ctrl+S（等价终端里输入后按 Ctrl+S：立即插入正在执行的轮次）。 */
+export async function sendTmuxCtrlS(target: string, text: string): Promise<void> {
+  const flat = text.replace(/\s*\n+\s*/g, ' ').trim();
+  if (flat) await run('tmux', ['send-keys', '-t', target, '-l', '--', flat]);
+  await run('tmux', ['send-keys', '-t', target, 'C-s']);
 }
 
 /** 原始按键注入（数字键/方向键/Escape 等，每个元素一次 send-keys 动作）。 */

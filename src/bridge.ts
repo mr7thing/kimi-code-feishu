@@ -18,7 +18,7 @@ import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
 import type { StreamEvent } from './streamParser.js';
 import { startCloudflaredTunnel, type TunnelHandle } from './tunnel.js';
-import { canInjectPts, captureTmux, listKimiSessions, sendPtsKeys, sendPtsText, sendTmuxKeys, sendTmuxText } from './tmux.js';
+import { canInjectPts, captureTmux, listKimiSessions, sendPtsCtrlS, sendPtsKeys, sendPtsText, sendTmuxCtrlS, sendTmuxKeys, sendTmuxText } from './tmux.js';
 
 const MAX_TEXT = 3500;         // 飞书单条文本消息的保守上限
 const PROGRESS_INTERVAL = 1500; // 进度消息最小更新间隔（毫秒）
@@ -755,6 +755,38 @@ export class Bridge {
       } catch {
         await this.channel.sendText(chatId, '❌ 读取画面失败（会话可能已退出），/a 重新选择');
       }
+    } else if (cmd === '/i') {
+      // 优先插话：绑定会话 → 文本+Ctrl+S 立即插入运行轮次；桥任务 → 打断带前缀重启
+      if (!arg) {
+        await this.channel.sendText(chatId, '用法：/i <文本>\n绑定会话：等同终端输入后按 Ctrl+S，立即插入运行中的轮次\n运行中任务：打断后带「优先处理」前缀立即重启');
+        return;
+      }
+      const attach = this.state.getAttach(chatId);
+      if (attach) {
+        const { kind, target: pane } = parseAttach(attach);
+        try {
+          if (kind === 'tmux') {
+            await sendTmuxCtrlS(pane, arg);
+          } else {
+            if (!(await canInjectPts())) {
+              await this.channel.sendText(chatId, '⚠️ pts 注入不可用（需 legacy_tiocsti=1 + 免密 sudo）');
+              return;
+            }
+            await sendPtsCtrlS(pane, arg);
+          }
+          this.publish(chatId, 'progress', `⚡ /i 优先插入：${truncate(arg, 120)}`);
+        } catch {
+          await this.channel.sendText(chatId, '❌ 注入失败（会话可能已退出），/a 重新选择');
+        }
+        return;
+      }
+      if (this.runner.isBusy(chatId)) {
+        this.runner.stop(chatId);
+        const ok = this.runner.submit(chatId, `[用户插话，请优先处理] ${arg}`);
+        await this.channel.sendText(chatId, ok ? `⚡ 已打断并插入优先指令：${truncate(arg, 80)}` : '❌ 插入失败');
+        return;
+      }
+      await this.channel.sendText(chatId, '当前没有运行中的任务，也没有绑定的终端会话（/i 用于执行中插话）');
     } else if (cmd === '/help') {
       await this.channel.sendText(chatId, HELP_TEXT);
     } else {
@@ -882,6 +914,7 @@ export const HELP_TEXT = `🤖 kimi-code-feishu 使用指南
 /dashboard    临时开启实时输出面板（/dashboard off 关闭）
 /a            列出终端 tmux 会话；/a 序号 绑定到本聊天
 /t <文本>     向绑定会话注入文本+回车（空文本=只回车）
+/i <文本>     优先插话：绑定会话=Ctrl+S 立即插入；运行中任务=打断带前缀重启
 /s            查看绑定会话当前画面
 /c            审批池列表；/c 序号或路径 切换（进池的终端会话才弹审批卡）
 /id           查看你的 open_id

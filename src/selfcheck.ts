@@ -21,7 +21,7 @@ import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
 import { StateStore } from './state.js';
 import { parseLine } from './streamParser.js';
-import { canInjectPts, captureTmux, listKimiSessions, sendPtsText, sendTmuxText } from './tmux.js';
+import { canInjectPts, captureTmux, listKimiSessions, sendPtsText, sendTmuxCtrlS, sendTmuxText } from './tmux.js';
 import type { Channel } from './channel.js';
 
 const execFileP = promisify(execFile);
@@ -589,6 +589,26 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
 
         await bridge.onFeishuMessage('chat-t', 'ou_boss', '/s');
         check('命令: /s 返回画面', channel.texts().some((t) => t.includes('当前画面')));
+
+        // /i 优先插话（tmux 路径：文本+Ctrl+S 到达）
+        await sendTmuxCtrlS(target, 'ctrls-inject');
+        await sleep(300);
+        check('tmux: Ctrl+S 注入文本到达', (await captureTmux(target, 5)).includes('ctrls-inject'));
+
+        // /i 优先插话（桥任务路径：打断带前缀重启）
+        state.setAttach('chat-t', null);
+        const fakeKimi = path.join(tmp, 'fake_kimi_sleep');
+        fs.writeFileSync(fakeKimi, '#!/bin/sh\nsleep 30\n', 'utf-8');
+        fs.chmodSync(fakeKimi, 0o755);
+        cfg.kimiBin = fakeKimi;
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '跑个长任务');
+        await sleep(300);
+        check('命令: /i 前提任务在运行', bridge.runner.isBusy('chat-t'));
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/i 优先做这个');
+        await sleep(300);
+        check('命令: /i 打断并插入优先指令',
+          channel.texts().some((t) => t.includes('插入优先指令')) && bridge.runner.isBusy('chat-t'));
+        bridge.runner.stopAll();
 
         // pts（非 tmux）绑定：可注入则真注入，否则给提示
         state.setAttach('chat-t', 'pts|/dev/pts/99');
