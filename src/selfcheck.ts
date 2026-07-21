@@ -571,7 +571,7 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
 
         const idx = (await listKimiSessions()).findIndex((s) => s.name === sess) + 1;
         await bridge.onFeishuMessage('chat-t', 'ou_boss', `/a ${idx}`);
-        check('命令: /a 序号绑定会话', state.getAttach('chat-t') === target);
+        check('命令: /a 序号绑定会话', state.getAttach('chat-t') === `tmux|${target}`);
 
         await bridge.onFeishuMessage('chat-t', 'ou_boss', '/t world-inject');
         await sleep(300);
@@ -579,6 +579,11 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
 
         await bridge.onFeishuMessage('chat-t', 'ou_boss', '/s');
         check('命令: /s 返回画面', channel.texts().some((t) => t.includes('当前画面')));
+
+        // pts（非 tmux）绑定后 /t 给出不可注入提示
+        state.setAttach('chat-t', 'pts|/dev/pts/99');
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/t hello');
+        check('命令: pts 会话 /t 提示不可注入', channel.texts().some((t) => t.includes('无法注入')));
       } finally {
         await execFileP('tmux', ['kill-session', '-t', sess]).catch(() => {});
       }

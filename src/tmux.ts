@@ -1,42 +1,119 @@
 /**
- * tmux 集成：终端交互会话的发现、输入注入（send-keys）、画面抓取（capture-pane）。
+ * 终端会话发现与注入：tmux 里的 kimi 会话可远程控制，普通终端的只能发现。
  *
- * 桥通过它把飞书变成 tmux 里 kimi 会话的远程键盘：
- * - 会话发现：列出所有 kcf-* 命名会话及含 kimi 进程的窗格
- * - 输入注入：send-keys 字面文本 + Enter，等价于在终端敲键盘
- * - 画面抓取：capture-pane 纯文本快照，/s 命令发到飞书
+ * 为什么普通终端（pts）不可注入：向其他终端注入按键唯一内核通道是
+ * TIOCSTI ioctl，新内核默认禁用（dev.tty.legacy_tiocsti=0）；
+ * 写 /dev/pts/N 只到显示侧而非输入侧。因此远程输入必须经由 tmux
+ * （它是 pts master），普通终端会话列出但标记为不可注入。
  */
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 
-export interface TmuxSession {
-  /** tmux 窗格目标（%N），send-keys/capture-pane 直接用 */
+export interface TermSession {
+  /** 注入目标：tmux 窗格 id（%N）或 pts 路径（/dev/pts/N） */
   target: string;
+  kind: 'tmux' | 'pts';
   name: string;
   cwd: string;
-  command: string;
+  pid?: number;
+  /** 可注入（tmux）才允许 /t /s /答题卡 */
+  injectable: boolean;
 }
 
-/** 列出 tmux 里的 kimi 会话（kcf-* 命名 或 窗格前台命令含 kimi）。tmux 未装/无服务返回空。 */
-export async function listKimiSessions(): Promise<TmuxSession[]> {
+interface ProcInfo {
+  pid: number;
+  ppid: number;
+  tty: string;
+  comm: string;
+  args: string;
+}
+
+function isKimiProc(p: ProcInfo): boolean {
+  // kimi TUI 进程 comm 就是 'kimi'；桥自身（node）和 hook 子进程（sh/node）不匹配
+  return p.comm === 'kimi';
+}
+
+async function processTable(): Promise<ProcInfo[]> {
+  const { stdout } = await run('ps', ['-eo', 'pid=,ppid=,tty=,comm=,args=']);
+  const out: ProcInfo[] = [];
+  for (const line of stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(line);
+    if (m) out.push({ pid: +m[1], ppid: +m[2], tty: m[3], comm: m[4], args: m[5] });
+  }
+  return out;
+}
+
+function findKimiDescendant(procs: ProcInfo[], rootPid: number, depth = 0): ProcInfo | undefined {
+  if (depth > 8) return undefined;
+  for (const p of procs) {
+    if (p.ppid !== rootPid) continue;
+    if (isKimiProc(p)) return p;
+    const d = findKimiDescendant(procs, p.pid, depth + 1);
+    if (d) return d;
+  }
+  return undefined;
+}
+
+function cwdOf(pid?: number): string {
+  if (!pid) return '';
+  try {
+    return fs.readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return '';
+  }
+}
+
+/** 列出所有活着的 kimi 终端会话：tmux（可注入）+ 普通 pts 终端（仅发现）。 */
+export async function listKimiSessions(): Promise<TermSession[]> {
+  const out: TermSession[] = [];
+  let procs: ProcInfo[] = [];
+  try {
+    procs = await processTable();
+  } catch {
+    /* ps 失败时退化为只列 tmux */
+  }
+
+  // 1) tmux 窗格：进程树里含 kimi 进程（kcf-* 命名保底也收）
   try {
     const { stdout } = await run('tmux', [
-      'list-panes', '-a', '-F', '#{session_name}\t#{pane_id}\t#{pane_current_command}\t#{pane_current_path}',
+      'list-panes', '-a', '-F', '#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}',
     ]);
-    const out: TmuxSession[] = [];
     for (const line of stdout.split('\n')) {
       if (!line.trim()) continue;
-      const [name, paneId, command, cwd] = line.split('\t');
-      if (name.startsWith('kcf-') || /kimi/i.test(command ?? '')) {
-        out.push({ target: paneId, name, cwd, command });
+      const [name, paneId, panePidStr, command, paneCwd] = line.split('\t');
+      const kimiProc = findKimiDescendant(procs, Number(panePidStr));
+      if (kimiProc || name.startsWith('kcf-')) {
+        out.push({
+          target: paneId,
+          kind: 'tmux',
+          name,
+          cwd: cwdOf(kimiProc?.pid) || paneCwd,
+          pid: kimiProc?.pid,
+          injectable: true,
+        });
       }
     }
-    return out;
   } catch {
-    return [];
+    /* 无 tmux 服务 */
   }
+
+  // 2) 普通终端的 kimi 进程（tty 是 pts 且不在 tmux 里）：仅发现
+  for (const p of procs) {
+    if (!isKimiProc(p) || !p.tty.startsWith('pts/')) continue;
+    if (out.some((s) => s.pid === p.pid)) continue;
+    out.push({
+      target: `/dev/${p.tty}`,
+      kind: 'pts',
+      name: `kimi@${p.tty}`,
+      cwd: cwdOf(p.pid),
+      pid: p.pid,
+      injectable: false,
+    });
+  }
+  return out;
 }
 
 /** 注入文本 + 回车（text 为空则只发回车）。多行文本拍平为一行，避免逐行提交。 */

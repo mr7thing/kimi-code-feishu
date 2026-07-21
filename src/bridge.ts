@@ -83,6 +83,13 @@ interface PendingAuq {
   sel: Set<number>;
 }
 
+/** 解析绑定的会话目标（'tmux|%3' 或 'pts|/dev/pts/2'；旧格式裸 %N 按 tmux 处理）。 */
+function parseAttach(v: string): { kind: 'tmux' | 'pts'; target: string } {
+  const i = v.indexOf('|');
+  if (i < 0) return { kind: 'tmux', target: v };
+  return { kind: v.slice(0, i) === 'pts' ? 'pts' : 'tmux', target: v.slice(i + 1) };
+}
+
 interface ProgressState {
   messageId?: string;
   lines: string[];
@@ -271,6 +278,7 @@ export class Bridge {
 
     const cwd = String(payload.cwd ?? '');
     const sess = (await listKimiSessions()).find((s) => {
+      if (!s.injectable) return false; // 只有 tmux 会话可注入按键
       try {
         return path.resolve(s.cwd) === path.resolve(cwd);
       } catch {
@@ -599,19 +607,30 @@ export class Bridge {
           return;
         }
         const s = sessions[n - 1];
-        this.state.setAttach(chatId, s.target);
-        await this.channel.sendText(chatId, `🔗 已绑定终端会话：${s.name}\n目录：\`${s.cwd}\`\n/t <文本> 注入回车，/s 查看画面，/a 重新选择`);
+        this.state.setAttach(chatId, `${s.kind}|${s.target}`);
+        await this.channel.sendText(
+          chatId,
+          `🔗 已绑定：${s.name}\n目录：\`${s.cwd}\`` +
+            (s.injectable ? '\n/t <文本> 注入回车，/s 查看画面' : '\n⚠️ 该会话不在 tmux，无法注入/抓屏（用 kimi-code-feishu tmux 重启可管控）'),
+        );
         return;
       }
       if (!sessions.length) {
-        await this.channel.sendText(chatId, '没有发现 tmux 里的 kimi 会话。\n先在终端用 `kimi-code-feishu tmux` 启动（或在任意 tmux 里跑 kimi）');
+        await this.channel.sendText(chatId, '没有发现 kimi 终端会话。\n在终端用 `kimi-code-feishu tmux` 启动即可被远程管控');
         return;
       }
       const cur = this.state.getAttach(chatId);
       await this.channel.sendText(
         chatId,
         '🖥 终端会话（/a 序号 绑定）：\n' +
-          sessions.map((s, i) => `${i + 1}. ${s.name}  \`${s.cwd}\`${s.target === cur ? '  ← 当前绑定' : ''}`).join('\n'),
+          sessions
+            .map((s, i) => {
+              const tag = s.kind === 'tmux' ? '⌨️可控' : '👀仅发现';
+              const bound = `${s.kind}|${s.target}` === cur ? '  ← 当前绑定' : '';
+              return `${i + 1}. [${tag}] ${s.name}  \`${s.cwd}\`${bound}`;
+            })
+            .join('\n') +
+          '\n⌨️可控=tmux 会话，可 /t 注入 /s 抓屏；👀仅发现=普通终端，审批卡正常但无法注入',
       );
     } else if (cmd === '/c') {
       const sessions = await listKimiSessions();
@@ -639,8 +658,13 @@ export class Bridge {
         await this.channel.sendText(chatId, '先用 /a 绑定一个终端会话');
         return;
       }
+      const { kind, target: pane } = parseAttach(target);
+      if (kind !== 'tmux') {
+        await this.channel.sendText(chatId, '⚠️ 绑定的会话不在 tmux，无法注入（内核禁用 TIOCSTI）。用 `kimi-code-feishu tmux` 重启会话后可管控');
+        return;
+      }
       try {
-        await sendTmuxText(target, arg);
+        await sendTmuxText(pane, arg);
         this.dashboardBus.publish(chatId, 'progress', `⌨️ /t 注入：${truncate(arg || '(回车)', 120)}`);
       } catch {
         await this.channel.sendText(chatId, '❌ 注入失败（会话可能已退出），/a 重新选择');
@@ -651,8 +675,13 @@ export class Bridge {
         await this.channel.sendText(chatId, '先用 /a 绑定一个终端会话');
         return;
       }
+      const { kind, target: pane } = parseAttach(target);
+      if (kind !== 'tmux') {
+        await this.channel.sendText(chatId, '⚠️ 绑定的会话不在 tmux，无法抓屏。可用 /dashboard 看实时输出');
+        return;
+      }
       try {
-        const shot = await captureTmux(target, 30);
+        const shot = await captureTmux(pane, 30);
         await this.channel.sendText(chatId, '🖥 当前画面：\n```\n' + truncate(shot.trimEnd() || '（空）', 2600) + '\n```');
       } catch {
         await this.channel.sendText(chatId, '❌ 读取画面失败（会话可能已退出），/a 重新选择');
