@@ -1,10 +1,10 @@
 /**
- * 终端会话发现与注入：tmux 里的 kimi 会话可远程控制，普通终端的只能发现。
+ * 终端会话发现与注入：tmux 里的 kimi 会话可远程控制，普通 pts 终端在
+ * 内核允许时（legacy_tiocsti=1 + 免密 sudo）也可注入按键。
  *
- * 为什么普通终端（pts）不可注入：向其他终端注入按键唯一内核通道是
- * TIOCSTI ioctl，新内核默认禁用（dev.tty.legacy_tiocsti=0）；
- * 写 /dev/pts/N 只到显示侧而非输入侧。因此远程输入必须经由 tmux
- * （它是 pts master），普通终端会话列出但标记为不可注入。
+ * pts 注入原理：TIOCSTI ioctl 把字节塞进终端输入队列（等同敲键盘）。
+ * 新内核默认禁用该 ioctl（dev.tty.legacy_tiocsti=0）且要求 root 或
+ * 控制会话，所以走 sudo 助手进程；不可用时降级为「仅发现」。
  */
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -19,8 +19,45 @@ export interface TermSession {
   name: string;
   cwd: string;
   pid?: number;
-  /** 可注入（tmux）才允许 /t /s /答题卡 */
+  /** 可注入（tmux，或 pts 且 TIOCSTI 可用）才允许 /t /答题卡 */
   injectable: boolean;
+}
+
+/** pts 注入能力：需要内核 legacy_tiocsti=1 + 免密 sudo（TIOCSTI 要 root 或控制会话）。 */
+let ptsCapable: boolean | null = null;
+export async function canInjectPts(): Promise<boolean> {
+  if (ptsCapable !== null) return ptsCapable;
+  try {
+    const { stdout } = await run('sysctl', ['-n', 'dev.tty.legacy_tiocsti']);
+    if (stdout.trim() !== '1') throw new Error('tiocsti off');
+    await run('sudo', ['-n', 'python3', '-c', 'import fcntl, termios']);
+    ptsCapable = true;
+  } catch {
+    ptsCapable = false;
+  }
+  return ptsCapable;
+}
+
+/** TIOCSTI 注入助手（root 运行）：把 payload 逐字符塞进终端输入队列。 */
+const PTS_INJECT_PY = `import sys, fcntl, termios
+tty, payload = sys.argv[1], sys.argv[2].encode()
+with open(tty, 'wb', buffering=0) as f:
+    for i in range(len(payload)):
+        fcntl.ioctl(f, termios.TIOCSTI, payload[i:i+1])
+`;
+
+/** 向 pts 注入文本 + 回车（需要 canInjectPts）。多行文本拍平为一行。 */
+export async function sendPtsText(tty: string, text: string): Promise<void> {
+  const flat = text.replace(/\s*\n+\s*/g, ' ').trim();
+  await run('sudo', ['-n', 'python3', '-c', PTS_INJECT_PY, tty, flat + '\n']);
+}
+
+/** 向 pts 注入按键序列：'Enter'→换行，'Escape'→ESC，其余取首字符。 */
+export async function sendPtsKeys(tty: string, keys: string[]): Promise<void> {
+  const payload = keys
+    .map((k) => (k === 'Enter' ? '\n' : k === 'Escape' ? '\x1b' : k[0] ?? ''))
+    .join('');
+  if (payload) await run('sudo', ['-n', 'python3', '-c', PTS_INJECT_PY, tty, payload]);
 }
 
 interface ProcInfo {
@@ -100,7 +137,8 @@ export async function listKimiSessions(): Promise<TermSession[]> {
     /* 无 tmux 服务 */
   }
 
-  // 2) 普通终端的 kimi 进程（tty 是 pts 且不在 tmux 里）：仅发现
+  // 2) 普通终端的 kimi 进程（tty 是 pts 且不在 tmux 里）：TIOCSTI 可用则可注入，否则仅发现
+  const ptsOk = await canInjectPts();
   for (const p of procs) {
     if (!isKimiProc(p) || !p.tty.startsWith('pts/')) continue;
     if (out.some((s) => s.pid === p.pid)) continue;
@@ -110,7 +148,7 @@ export async function listKimiSessions(): Promise<TermSession[]> {
       name: `kimi@${p.tty}`,
       cwd: cwdOf(p.pid),
       pid: p.pid,
-      injectable: false,
+      injectable: ptsOk,
     });
   }
   return out;

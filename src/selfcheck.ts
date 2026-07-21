@@ -20,7 +20,7 @@ import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
 import { StateStore } from './state.js';
 import { parseLine } from './streamParser.js';
-import { captureTmux, listKimiSessions, sendTmuxText } from './tmux.js';
+import { canInjectPts, captureTmux, listKimiSessions, sendPtsText, sendTmuxText } from './tmux.js';
 import type { Channel } from './channel.js';
 
 const execFileP = promisify(execFile);
@@ -580,10 +580,44 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
         await bridge.onFeishuMessage('chat-t', 'ou_boss', '/s');
         check('命令: /s 返回画面', channel.texts().some((t) => t.includes('当前画面')));
 
-        // pts（非 tmux）绑定后 /t 给出不可注入提示
+        // pts（非 tmux）绑定：可注入则真注入，否则给提示
         state.setAttach('chat-t', 'pts|/dev/pts/99');
         await bridge.onFeishuMessage('chat-t', 'ou_boss', '/t hello');
-        check('命令: pts 会话 /t 提示不可注入', channel.texts().some((t) => t.includes('无法注入')));
+        check('命令: pts 会话 /t 有明确反馈', channel.texts().some((t) => t.includes('无法注入') || t.includes('注入失败')));
+
+        // pts 真注入（需要 legacy_tiocsti=1 + 免密 sudo；不满足则跳过）
+        if (await canInjectPts()) {
+          // 用 python pty.fork 起一个带伪终端的 cat：stdout 首行是它的 tty，后续是终端回显
+          const victim = spawn('python3', ['-c', `import os, pty, time, sys, select
+pid, master = pty.fork()
+if pid == 0:
+    os.execvp('cat', ['cat'])
+print(os.readlink('/proc/%d/fd/0' % pid), flush=True)
+end = time.time() + 30
+while time.time() < end:
+    r, _, _ = select.select([master], [], [], 1)
+    if r:
+        sys.stdout.buffer.write(os.read(master, 4096)); sys.stdout.buffer.flush()
+`], { stdio: ['ignore', 'pipe', 'ignore'] });
+          let buf = '';
+          victim.stdout!.on('data', (d: Buffer) => { buf += d.toString(); });
+          try {
+            let ok = false;
+            for (let i = 0; i < 30; i++) {
+              const nl = buf.indexOf('\n');
+              if (nl > 0 && buf.slice(0, nl).startsWith('/dev/pts/')) {
+                if (buf.includes('pts-inject-ok')) { ok = true; break; }
+                await sendPtsText(buf.slice(0, nl).trim(), 'pts-inject-ok').catch(() => {});
+              }
+              await sleep(300);
+            }
+            check('pts: TIOCSTI 注入文本到达目标终端', ok);
+          } finally {
+            victim.kill();
+          }
+        } else {
+          console.log('⏭️  pts 注入不可用（tiocsti/sudo），跳过');
+        }
       } finally {
         await execFileP('tmux', ['kill-session', '-t', sess]).catch(() => {});
       }

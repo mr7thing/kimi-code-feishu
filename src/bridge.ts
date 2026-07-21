@@ -17,7 +17,7 @@ import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
 import type { StreamEvent } from './streamParser.js';
 import { startCloudflaredTunnel, type TunnelHandle } from './tunnel.js';
-import { captureTmux, listKimiSessions, sendTmuxKeys, sendTmuxText } from './tmux.js';
+import { canInjectPts, captureTmux, listKimiSessions, sendPtsKeys, sendPtsText, sendTmuxKeys, sendTmuxText } from './tmux.js';
 
 const MAX_TEXT = 3500;         // 飞书单条文本消息的保守上限
 const PROGRESS_INTERVAL = 1500; // 进度消息最小更新间隔（毫秒）
@@ -77,6 +77,7 @@ function parseAuqQuestions(ti: unknown): AuqQuestion[] {
 /** 进行中的提问（等用户点卡片）：reqId → 注入目标与状态。 */
 interface PendingAuq {
   chatId: string;
+  kind: 'tmux' | 'pts';
   tmuxTarget: string;
   messageId?: string;
   question: AuqQuestion;
@@ -290,7 +291,7 @@ export class Bridge {
     if (!chatId) return { decision: 'allow', reason: '提问在终端等待，无聊天可通知' };
 
     const reqId = crypto.randomBytes(6).toString('hex');
-    const pending: PendingAuq = { chatId, tmuxTarget: sess.target, question: questions[0], sel: new Set() };
+    const pending: PendingAuq = { chatId, kind: sess.kind, tmuxTarget: sess.target, question: questions[0], sel: new Set() };
     this.auqPending.set(reqId, pending);
     setTimeout(() => this.auqPending.delete(reqId), 30 * 60_000).unref(); // 防泄漏
 
@@ -352,7 +353,8 @@ export class Bridge {
       return null;
     }
     const send = (keys: string[]): void => {
-      sendTmuxKeys(p.tmuxTarget, keys)
+      const job = p.kind === 'pts' ? sendPtsKeys(p.tmuxTarget, keys) : sendTmuxKeys(p.tmuxTarget, keys);
+      job
         .then(() => this.dashboardBus.publish(p.chatId, 'progress', `⌨️ 提问作答注入：${keys.join(' ')}`))
         .catch((err) => console.error('[bridge] 提问作答注入失败:', err));
     };
@@ -625,12 +627,12 @@ export class Bridge {
         '🖥 终端会话（/a 序号 绑定）：\n' +
           sessions
             .map((s, i) => {
-              const tag = s.kind === 'tmux' ? '⌨️可控' : '👀仅发现';
+              const tag = s.injectable ? '⌨️可控' : '👀仅发现';
               const bound = `${s.kind}|${s.target}` === cur ? '  ← 当前绑定' : '';
               return `${i + 1}. [${tag}] ${s.name}  \`${s.cwd}\`${bound}`;
             })
             .join('\n') +
-          '\n⌨️可控=tmux 会话，可 /t 注入 /s 抓屏；👀仅发现=普通终端，审批卡正常但无法注入',
+          '\n⌨️可控=tmux 会话或 pts 注入可用；👀仅发现=无法注入（审批卡正常）',
       );
     } else if (cmd === '/c') {
       const sessions = await listKimiSessions();
@@ -660,7 +662,16 @@ export class Bridge {
       }
       const { kind, target: pane } = parseAttach(target);
       if (kind !== 'tmux') {
-        await this.channel.sendText(chatId, '⚠️ 绑定的会话不在 tmux，无法注入（内核禁用 TIOCSTI）。用 `kimi-code-feishu tmux` 重启会话后可管控');
+        if (!(await canInjectPts())) {
+          await this.channel.sendText(chatId, '⚠️ 绑定的会话不在 tmux，且 pts 注入不可用（需 legacy_tiocsti=1 + 免密 sudo）。用 `kimi-code-feishu tmux` 重启会话后可管控');
+          return;
+        }
+        try {
+          await sendPtsText(pane, arg);
+          this.dashboardBus.publish(chatId, 'progress', `⌨️ /t 注入(pts)：${truncate(arg || '(回车)', 120)}`);
+        } catch {
+          await this.channel.sendText(chatId, '❌ 注入失败（终端可能已关闭），/a 重新选择');
+        }
         return;
       }
       try {
