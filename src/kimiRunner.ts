@@ -59,6 +59,15 @@ export class KimiRunner {
     return this.active.has(chatId);
   }
 
+  /** 进行中任务摘要（dashboard 状态面板用）。 */
+  activeTasks(): Array<{ chatId: string; prompt: string; ageSec: number }> {
+    return [...this.active.values()].map((t) => ({
+      chatId: t.chatId,
+      prompt: t.prompt,
+      ageSec: Math.round((Date.now() - t.startedAt) / 1000),
+    }));
+  }
+
   /** 启动一个 headless 任务；该聊天已有任务在跑时返回 false。kimi 不存在时抛错。 */
   submit(chatId: string, prompt: string): boolean {
     if (this.active.has(chatId)) return false;

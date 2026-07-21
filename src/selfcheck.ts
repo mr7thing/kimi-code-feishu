@@ -496,7 +496,10 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
   {
     const dash = new Dashboard();
     const port = await freePort();
-    const srv = await serveDashboard(dash, '127.0.0.1', port, 'tok123', { idlePageMs: 600_000, idleNopageMs: 600_000, onClose: () => {} });
+    const srv = await serveDashboard(dash, '127.0.0.1', port, 'tok123', {
+      idlePageMs: 600_000, idleNopageMs: 600_000, onClose: () => {},
+      statusProvider: () => ({ marker: 'st-1' }),
+    });
     const base = `http://127.0.0.1:${port}`;
 
     const r1 = await fetch(`${base}/events`);
@@ -512,6 +515,11 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
     const reader = r3.body!.getReader();
     const { value } = await reader.read();
     check('Dashboard: SSE 回放到已发布事件', new TextDecoder().decode(value).includes('hello-dashboard-xyz'));
+
+    const r4 = await fetch(`${base}/api/status?token=tok123`);
+    const status = (await r4.json()) as { sessions?: unknown[]; marker?: string };
+    check('Dashboard: /api/status 返回状态面板数据', r4.status === 200 && status.marker === 'st-1');
+    check('Dashboard: 页面含状态区', html.includes('id="status"'));
 
     const hb = await fetch(`${base}/heartbeat?token=tok123`, { method: 'POST' });
     check('Dashboard: 心跳保活 204', hb.status === 204);

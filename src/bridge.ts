@@ -156,6 +156,7 @@ export class Bridge {
       idlePageMs: this.cfg.dashboardIdleTimeoutPage * 1000,
       idleNopageMs: this.cfg.dashboardIdleTimeoutNopage * 1000,
       onClose: (reason) => void this.onDashboardClosed(reason),
+      statusProvider: () => this.dashboardStatus(),
     });
     this.dashToken = token;
 
@@ -174,6 +175,41 @@ export class Bridge {
     if (!this.dashServer || !this.dashToken) return null;
     const base = this.dashPublic ?? this.tunnel?.url ?? `http://${this.cfg.dashboardHost}:${this.cfg.dashboardPort}`;
     return `${base}?token=${this.dashToken}`;
+  }
+
+  /** 状态面板数据：终端会话（含 tmux 画面）、进行中任务、待审批、待回答提问。 */
+  private async dashboardStatus(): Promise<Record<string, unknown>> {
+    const sessions = await listKimiSessions().catch(() => []);
+    const withScreens = await Promise.all(
+      sessions.map(async (s) => {
+        let screen: string | null = null;
+        if (s.kind === 'tmux') {
+          try {
+            screen = (await captureTmux(s.target, 12)).trimEnd() || null;
+          } catch {
+            screen = '(读取失败)';
+          }
+        }
+        return { name: s.name, kind: s.kind, cwd: s.cwd, injectable: s.injectable, screen };
+      }),
+    );
+    return {
+      sessions: withScreens,
+      tasks: this.runner.activeTasks(),
+      approvals: this.approvals.pendingList().map((ap) => ({
+        reqId: ap.reqId,
+        tool: ap.toolName,
+        summary: toolInputSummary(ap.payload, 200),
+        chatId: ap.chatId,
+        ageSec: Math.round((Date.now() - ap.createdAt) / 1000),
+      })),
+      questions: [...this.auqPending.entries()].map(([reqId, p]) => ({
+        reqId,
+        question: p.question.question,
+        options: p.question.options,
+        chatId: p.chatId,
+      })),
+    };
   }
 
   /** 主动关闭（/dashboard off）。返回是否真有在跑。 */

@@ -84,4 +84,9 @@ export class ApprovalManager {
   pendingCount(): number {
     return this.pending.size;
   }
+
+  /** 待审批列表（dashboard 状态面板用）。 */
+  pendingList(): Approval[] {
+    return [...this.pending.values()];
+  }
 }

@@ -66,6 +66,8 @@ export interface ServeDashboardOptions {
   idleNopageMs: number;
   /** 任何路径的关闭都会回调（闲置、页面关闭、主动 close）。 */
   onClose: (reason: string) => void;
+  /** 状态面板数据源（终端会话/任务/待办），GET /api/status 返回其 JSON。 */
+  statusProvider?: () => Promise<unknown> | unknown;
 }
 
 export function serveDashboard(
@@ -104,6 +106,21 @@ export function serveDashboard(
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('已关闭');
       void shutdown('用户在页面上手动关闭');
+      return;
+    }
+
+    // 状态面板数据（不算心跳活动——隐藏的页面不应保活）
+    if (url.pathname === '/api/status') {
+      void (async () => {
+        try {
+          const data = opts.statusProvider ? await opts.statusProvider() : {};
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(data));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: String(err) }));
+        }
+      })();
       return;
     }
 
@@ -181,6 +198,14 @@ const DASHBOARD_HTML = `<!doctype html>
   #closeBtn { margin-left: auto; font: inherit; color: #fff; background: #c72e2e; border: none; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
   #closeBtn:hover { background: #e04040; }
   #log { padding: 8px 12px 40px; white-space: pre-wrap; word-break: break-all; }
+  #status { border-bottom: 1px solid #333; }
+  .sec { padding: 8px 12px; border-bottom: 1px solid #2a2a2a; }
+  .sec h3 { font-size: 12px; color: #999; margin-bottom: 6px; }
+  .sec .item { margin: 3px 0; }
+  .sec .meta { color: #888; font-size: 12px; }
+  .sec pre { background: #181818; border: 1px solid #2a2a2a; border-radius: 4px; padding: 6px 8px;
+             margin-top: 4px; max-height: 220px; overflow: auto; color: #9a9a9a; white-space: pre-wrap; word-break: break-all; }
+  .sec .warn { color: #e5c07b; }
   .line { display: flex; gap: 8px; }
   .time { color: #666; flex-shrink: 0; }
   .chat { color: #c586c0; flex-shrink: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
@@ -200,6 +225,7 @@ const DASHBOARD_HTML = `<!doctype html>
   <label><input type="checkbox" id="scroll" checked> 自动滚动</label>
   <button id="closeBtn">关闭 Dashboard</button>
 </header>
+<div id="status"></div>
 <div id="log"></div>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
@@ -280,6 +306,68 @@ closeBtn.onclick = async () => {
   es.close();
   document.body.innerHTML = '<p style="padding:40px;text-align:center;color:#888">Dashboard 已关闭，可以关掉这个页面了</p>';
 };
+
+// ---------------- 状态面板（5s 刷新） ----------------
+const statusEl = document.getElementById('status');
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function renderStatus(d) {
+  statusEl.textContent = '';
+
+  const pendCount = (d.approvals?.length || 0) + (d.questions?.length || 0);
+  if (pendCount) {
+    const sec = el('div', 'sec');
+    sec.appendChild(el('h3', null, '⏳ 待你处理 (' + pendCount + ')'));
+    for (const a of d.approvals || []) {
+      const it = el('div', 'item warn', '🔐 ' + a.tool + '：' + (a.summary || ''));
+      it.appendChild(el('span', 'meta', '　(' + a.ageSec + 's 前) — 在飞书审批卡片中回答'));
+      sec.appendChild(it);
+    }
+    for (const q of d.questions || []) {
+      const it = el('div', 'item warn', '❓ ' + q.question + '　[' + (q.options || []).join(' / ') + ']');
+      it.appendChild(el('span', 'meta', '　— 飞书卡片选择，或 /t 直接作答'));
+      sec.appendChild(it);
+    }
+    statusEl.appendChild(sec);
+  }
+
+  if (d.sessions?.length) {
+    const sec = el('div', 'sec');
+    sec.appendChild(el('h3', null, '🖥 终端会话 (' + d.sessions.length + ')'));
+    for (const s of d.sessions) {
+      const tag = s.kind === 'tmux' ? 'tmux' : (s.injectable ? 'pts 仅注入' : 'pts 仅发现');
+      sec.appendChild(el('div', 'item', '• ' + s.name + '  '));
+      sec.lastChild.appendChild(el('span', 'meta', s.cwd + '　[' + tag + ']'));
+      if (s.screen) sec.appendChild(el('pre', null, s.screen));
+    }
+    statusEl.appendChild(sec);
+  }
+
+  if (d.tasks?.length) {
+    const sec = el('div', 'sec');
+    sec.appendChild(el('h3', null, '🏃 任务 (' + d.tasks.length + ')'));
+    for (const t of d.tasks) {
+      sec.appendChild(el('div', 'item', '• ' + t.prompt.slice(0, 80)));
+      sec.lastChild.appendChild(el('span', 'meta', '　已运行 ' + t.ageSec + 's'));
+    }
+    statusEl.appendChild(sec);
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status?token=' + encodeURIComponent(token));
+    if (r.ok) renderStatus(await r.json());
+  } catch {}
+}
+setInterval(refreshStatus, 5000);
+refreshStatus();
 </script>
 </body>
 </html>
