@@ -767,7 +767,14 @@ export class Bridge {
       }
       const { kind, target: pane } = parseAttach(target);
       if (kind !== 'tmux') {
-        await this.channel.sendText(chatId, '⚠️ pts 终端无法抓屏（pts 只写不读，原理限制，不是故障）；tmux 会话才支持 /s');
+        // pts 屏幕读不到，改读该会话的磁盘转录尾部（cwd 匹配最近活跃的 wire 文件）
+        const sess = (await listKimiSessions()).find((s) => s.kind === 'pts' && s.target === pane);
+        const tail = sess ? this.wires.readTail({ cwd: sess.cwd }, 20) : null;
+        if (tail) {
+          await this.channel.sendText(chatId, '📡 该会话最近对话（磁盘转录，pts 无法抓屏）：\n```\n' + truncate(tail, 2400) + '\n```');
+        } else {
+          await this.channel.sendText(chatId, '⚠️ pts 终端无法抓屏，且未找到该会话的转录文件；tmux 会话 /s 可直接抓屏');
+        }
         return;
       }
       try {

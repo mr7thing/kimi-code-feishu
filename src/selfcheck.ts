@@ -741,6 +741,13 @@ while time.time() < end:
     check('转录: watcher 回放历史', okWatch && got.some((l) => l.includes('历史消息')));
     check('转录: watcher 增量推送', pumped);
     watcher.stopAll();
+
+    // readTail：按 cwd 定位工作目录下最近活跃的 wire 文件
+    const wf2 = path.join(tmp, 'wd_myproj_abc123', 'session_x1', 'agents', 'main');
+    fs.mkdirSync(wf2, { recursive: true });
+    fs.writeFileSync(path.join(wf2, 'wire.jsonl'), '{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"尾部问题"}]}}\n');
+    const tail = watcher.readTail({ cwd: '/home/x/myproj' }, 5);
+    check('转录: readTail 按 cwd 读取', !!tail && tail.includes('尾部问题'));
   }
 
   // ---------------------------------------------------------------- 汇总

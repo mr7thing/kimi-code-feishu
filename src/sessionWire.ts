@@ -79,10 +79,62 @@ interface WatchEntry {
   offset: number;
 }
 
+/** 按 cwd 定位某工作目录下最近活跃的 wire 文件（wd_<basename>_* 下 mtime 最新）。 */
 export class WireWatcher {
   private watches = new Map<string, WatchEntry>();
 
   constructor(private sessionsDir = path.join(os.homedir(), '.kimi-code', 'sessions')) {}
+
+  /** 读取会话转录尾部（渲染后最近 lines 行）；sessionId 或 cwd 二选一，找不到返回 null。 */
+  readTail(opts: { sessionId?: string; cwd?: string }, lines = 20): string | null {
+    const file = opts.sessionId
+      ? this.findWirePath(opts.sessionId)
+      : opts.cwd
+        ? this.findLatestWireByCwd(opts.cwd)
+        : null;
+    if (!file) return null;
+    try {
+      const stat = fs.statSync(file);
+      const start = Math.max(0, stat.size - 64 * 1024);
+      const buf = Buffer.alloc(stat.size - start);
+      const fd = fs.openSync(file, 'r');
+      fs.readSync(fd, buf, 0, buf.length, start);
+      fs.closeSync(fd);
+      const rendered = buf
+        .toString('utf-8')
+        .split('\n')
+        .map(renderWireLine)
+        .filter((l): l is string => !!l);
+      return rendered.slice(-lines).join('\n') || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private findLatestWireByCwd(cwd: string): string | null {
+    const base = path.basename(cwd.replace(/\/+$/, ''));
+    if (!base) return null;
+    let best: { p: string; mtime: number } | null = null;
+    try {
+      for (const wd of fs.readdirSync(this.sessionsDir)) {
+        if (!wd.startsWith(`wd_${base}_`)) continue;
+        const wdDir = path.join(this.sessionsDir, wd);
+        for (const sess of fs.readdirSync(wdDir)) {
+          const p = path.join(wdDir, sess, 'agents', 'main', 'wire.jsonl');
+          try {
+            const mtime = fs.statSync(p).mtimeMs;
+            if (!best || mtime > best.mtime) best = { p, mtime };
+          } catch {
+            /* 无 wire 文件 */
+          }
+        }
+      }
+    } catch {
+      /* sessions 目录不存在 */
+    }
+    return best?.p ?? null;
+  }
+
 
   /** 开始监听某会话的 wire 转录（幂等）。找不到转录文件返回 false。 */
   async watch(sessionId: string, cb: (line: string) => void): Promise<boolean> {
