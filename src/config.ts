@@ -5,10 +5,14 @@
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { parse as parseToml } from 'smol-toml';
 
 export const DEFAULT_CONFIG_DIR = path.join(os.homedir(), '.kimi-code-feishu');
 export const DEFAULT_CONFIG_PATH = path.join(DEFAULT_CONFIG_DIR, 'config.toml');
+
+/** 包安装路径（dist 的上一级）：飞书会话的默认工作目录与 session 存放地。 */
+export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /** 只读类工具默认自动放行（不推审批卡片），避免刷屏。 */
 export const DEFAULT_AUTO_ALLOW_TOOLS = [
@@ -75,7 +79,7 @@ export function defaultConfig(): Config {
     appId: '',
     appSecret: '',
     allowedUserIds: [],
-    workDir: os.homedir(),
+    workDir: PACKAGE_ROOT,
     bridgeHost: '127.0.0.1',
     bridgePort: 17771,
     approvalTimeout: 150,
@@ -126,7 +130,7 @@ app_secret = "${v.appSecret ?? 'xxxxxxxx'}"
 allowed_user_ids = [${(v.allowedUserIds?.length ? v.allowedUserIds : ['ou_xxxxxxxx']).map((s) => `"${s}"`).join(', ')}]
 
 # 默认工作目录（飞书里可用 /bind 按会话覆盖）
-work_dir = "${v.workDir ?? '/home/yourname/projects'}"
+work_dir = "${v.workDir ?? PACKAGE_ROOT}"
 
 [bridge]
 bridge_host = "127.0.0.1"

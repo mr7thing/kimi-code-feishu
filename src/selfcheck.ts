@@ -14,7 +14,7 @@ import { parse as parseToml } from 'smol-toml';
 import { ApprovalManager } from './approvals.js';
 import { pollAppRegistration, RegistrationError, requestAppRegistration } from './appRegistration.js';
 import { Bridge, toolInputSummary } from './bridge.js';
-import { loadConfig, saveConfig } from './config.js';
+import { loadConfig, saveConfig, defaultConfig, PACKAGE_ROOT } from './config.js';
 import { ChatLogger, LoggingChannel } from './chatLogger.js';
 import { Dashboard, serveDashboard } from './dashboard.js';
 import { serveHooks } from './hookServer.js';
@@ -119,6 +119,7 @@ async function main(): Promise<void> {
     check('配置加载: app_id', cfg.appId === 'cli_test');
     check('配置加载: approval_timeout', cfg.approvalTimeout === 10);
     check('配置加载: 默认 auto_allow_tools 非空', cfg.autoAllowTools.length > 3);
+    check('配置加载: 默认 workDir 为包安装路径', defaultConfig().workDir === PACKAGE_ROOT);
 
     // onboard 写入配置：renderExampleConfig 带真实值 → 合法 TOML 且可回读
     const cfgPath2 = path.join(tmp, 'onboard.toml');
@@ -609,6 +610,26 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
         await sendTmuxCtrlS(target, 'ctrls-inject');
         await sleep(300);
         check('tmux: Ctrl+S 注入文本到达', (await captureTmux(target, 5)).includes('ctrls-inject'));
+        // 裸 pane 里 C-s = XOFF 暂停输出，补 C-q（XON）恢复，避免影响后续注入
+        await execFileP('tmux', ['send-keys', '-t', target, 'C-q']);
+
+        // 终端模式：纯文本自动注入会话（无需 /t）
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', 'hello-auto-inject');
+        await sleep(300);
+        check('终端模式: 纯文本自动注入会话', (await captureTmux(target, 5)).includes('hello-auto-inject'));
+
+        // /task 显式派任务（绑定不影响）；随后 /a free 释放
+        const fakeSleep = path.join(tmp, 'fake_sleep');
+        fs.writeFileSync(fakeSleep, '#!/bin/sh\nsleep 30\n', 'utf-8');
+        fs.chmodSync(fakeSleep, 0o755);
+        cfg.kimiBin = fakeSleep;
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/task 跑个东西');
+        await sleep(300);
+        check('终端模式: /task 显式派任务', bridge.runner.isBusy('chat-t') && channel.texts().some((t) => t.includes('已开工')));
+        bridge.runner.stopAll();
+
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/a free');
+        check('命令: /a free 释放绑定', state.getAttach('chat-t') === null);
 
         // /i 优先插话（桥任务路径：打断带前缀重启）
         state.setAttach('chat-t', null);

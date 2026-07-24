@@ -264,7 +264,7 @@ const scrollBox = document.getElementById('scroll');
 const dot = document.getElementById('dot');
 const closeBtn = document.getElementById('closeBtn');
 const knownChats = new Set();
-const CONV_KINDS = new Set(['in', 'out', 'progress']); // 飞书对话：消息+卡片/审批事件；其余进本地会话
+const CONV_KINDS = new Set(['in', 'out', 'progress', 'stdout', 'stderr', 'lifecycle']); // 飞书对话：聊天消息+审批/进度+桥任务输出；仅终端会话转录（session）进本地会话
 
 function fmtTime(ts) {
   const d = new Date(ts);

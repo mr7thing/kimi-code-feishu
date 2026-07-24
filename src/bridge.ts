@@ -645,9 +645,11 @@ export class Bridge {
     } else if (cmd === '/status') {
       const busy = this.runner.isBusy(chatId);
       const wd = this.state.getWorkDir(chatId, this.cfg.workDir);
+      const attach = this.state.getAttach(chatId);
       await this.channel.sendText(
         chatId,
-        `📊 状态\n任务：${busy ? '🏃 运行中' : '💤 空闲'}\n目录：\`${wd}\`\n` +
+        `📊 状态\n模式：${attach ? `⌨️ 终端模式（${attach}，纯文本=注入）` : '💬 飞书任务模式（纯文本=派任务）'}\n` +
+        `任务：${busy ? '🏃 运行中' : '💤 空闲'}\n目录：\`${wd}\`\n` +
         `会话：${this.state.hasSession(chatId) ? '续接模式' : '新会话'}\n待审批：${this.approvals.pendingCount()} 条`,
       );
     } else if (cmd === '/dashboard') {
@@ -680,6 +682,13 @@ export class Bridge {
         await this.channel.sendText(chatId, `❌ 开启 Dashboard 失败：${err instanceof Error ? err.message : err}`);
       }
     } else if (cmd === '/a') {
+      // /a free 或 /a 0：释放绑定，切回飞书任务模式
+      if (['free', '0', 'off'].includes(arg.toLowerCase())) {
+        const had = this.state.getAttach(chatId);
+        this.state.setAttach(chatId, null);
+        await this.channel.sendText(chatId, had ? '🔓 已释放终端会话绑定，切回飞书任务模式（直接发消息派任务）' : '当前没有绑定的终端会话');
+        return;
+      }
       const sessions = await listKimiSessions();
       if (arg) {
         const n = Number(arg);
@@ -691,9 +700,9 @@ export class Bridge {
         this.state.setAttach(chatId, `${s.kind}|${s.target}`);
         const hint =
           s.kind === 'tmux'
-            ? '\n/t <文本> 注入回车，/s 查看画面'
+            ? '\n已进入终端模式：直接发消息即注入该会话（/task 派飞书任务，/s 看画面，/a free 切回）'
             : s.injectable
-              ? '\n/t 可注入；pts 终端无法抓屏（/s 仅 tmux 会话可用）'
+              ? '\n已进入终端模式：直接发消息即注入；pts 无法抓屏（/a free 切回）'
               : '\n⚠️ 该会话不在 tmux，无法注入/抓屏（用 kimi-code-feishu tmux 重启可管控）';
         await this.channel.sendText(chatId, `🔗 已绑定：${s.name}\n目录：\`${s.cwd}\`${hint}`);
         return;
@@ -705,7 +714,7 @@ export class Bridge {
       const cur = this.state.getAttach(chatId);
       await this.channel.sendText(
         chatId,
-        '🖥 终端会话（/a 序号 绑定）：\n' +
+        '🖥 终端会话（/a 序号 绑定，/a free 释放）：\n' +
           sessions
             .map((s, i) => {
               const tag = s.kind === 'tmux' ? '⌨️可控' : s.injectable ? '⌨️仅注入' : '👀仅发现';
@@ -819,17 +828,48 @@ export class Bridge {
       await this.channel.sendText(chatId, '当前没有运行中的任务，也没有绑定的终端会话（/i 用于执行中插话）');
     } else if (cmd === '/help') {
       await this.channel.sendText(chatId, HELP_TEXT);
+    } else if (cmd === '/task') {
+      await this.dispatchTask(chatId, arg);
     } else {
-      if (this.runner.isBusy(chatId)) {
-        await this.channel.sendText(chatId, '⏳ 上一个任务还在执行，先 /stop 或等它完成');
+      // 绑定终端会话时：纯文本自动注入该会话（终端模式）；否则派飞书任务
+      const attach = this.state.getAttach(chatId);
+      if (attach) {
+        const { kind, target: pane } = parseAttach(attach);
+        try {
+          if (kind === 'tmux') {
+            await sendTmuxText(pane, text);
+          } else {
+            if (!(await canInjectPts())) {
+              await this.channel.sendText(chatId, '⚠️ pts 注入不可用（需 legacy_tiocsti=1 + 免密 sudo）。/a free 切回飞书模式');
+              return;
+            }
+            await sendPtsText(pane, text);
+          }
+          this.publish(chatId, 'progress', `⌨️ 注入：${truncate(text, 120)}`);
+        } catch {
+          await this.channel.sendText(chatId, '❌ 注入失败（会话可能已退出），/a 重新选择或 /a free 切回');
+        }
         return;
       }
-      try {
-        const ok = this.runner.submit(chatId, text);
-        if (ok) await this.channel.sendText(chatId, `🚀 已开工：${truncate(text, 80)}`);
-      } catch {
-        await this.channel.sendText(chatId, `❌ 找不到 kimi 命令（kimi_bin=${this.cfg.kimiBin}），请检查配置`);
-      }
+      await this.dispatchTask(chatId, text);
+    }
+  }
+
+  /** 派发桥任务（kimi -p）。 */
+  private async dispatchTask(chatId: string, text: string): Promise<void> {
+    if (!text.trim()) {
+      await this.channel.sendText(chatId, '用法：/task <任务内容>');
+      return;
+    }
+    if (this.runner.isBusy(chatId)) {
+      await this.channel.sendText(chatId, '⏳ 上一个任务还在执行，先 /stop 或等它完成');
+      return;
+    }
+    try {
+      const ok = this.runner.submit(chatId, text);
+      if (ok) await this.channel.sendText(chatId, `🚀 已开工：${truncate(text, 80)}`);
+    } catch {
+      await this.channel.sendText(chatId, `❌ 找不到 kimi 命令（kimi_bin=${this.cfg.kimiBin}），请检查配置`);
     }
   }
 
@@ -934,18 +974,21 @@ export class Bridge {
 
 export const HELP_TEXT = `🤖 kimi-code-feishu 使用指南
 
-直接发消息 = 让 Kimi Code 执行任务（流式回报进度，危险操作会弹审批卡片）
+两种模式：
+💬 飞书任务模式（默认）：直接发消息 = 派 kimi -p 任务（流式回报，危险操作弹审批卡）
+⌨️ 终端模式（/a 绑定后）：直接发消息 = 注入终端会话；/task 才派飞书任务
 
 命令：
 /bind <目录>  绑定本项目的工作目录
 /new          开启新会话（默认会续接上次会话）
 /stop         终止正在执行的任务
-/status       查看当前状态
-/dashboard    临时开启实时输出面板（/d 短别名；/dashboard public 开公网隧道；/dashboard off 关闭）
-/a            列出终端 tmux 会话；/a 序号 绑定到本聊天
-/t <文本>     向绑定会话注入文本+回车（空文本=只回车）
+/status       查看当前状态（含当前模式）
+/task <文本>  显式派发飞书任务（终端模式下派任务用）
+/dashboard    临时开启实时输出面板（/d 短别名；public 开公网隧道；off 关闭）
+/a            列出终端会话；/a 序号 绑定进入终端模式；/a free 或 /a 0 释放切回
+/t <文本>     显式注入文本+回车（终端模式下一般不用，直接发消息即可）
 /i <文本>     优先插话：绑定会话=Ctrl+S 立即插入；运行中任务=打断带前缀重启
-/s            查看绑定会话当前画面
+/s            查看绑定会话：tmux=实时抓屏；pts=读磁盘转录尾部
 /c            审批池列表；/c 序号或路径 切换（进池的终端会话才弹审批卡）
 /id           查看你的 open_id
 /help         本帮助

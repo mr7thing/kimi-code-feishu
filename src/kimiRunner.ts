@@ -165,6 +165,7 @@ export class KimiRunner {
 
   stopAll(): void {
     for (const task of this.active.values()) this.kill(task);
+    this.active.clear();
   }
 
   private kill(task: ChatTask): void {
