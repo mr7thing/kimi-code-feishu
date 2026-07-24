@@ -68,6 +68,8 @@ export interface ServeDashboardOptions {
   onClose: (reason: string) => void;
   /** 状态面板数据源（终端会话/任务/待办），GET /api/status 返回其 JSON。 */
   statusProvider?: () => Promise<unknown> | unknown;
+  /** 单个终端会话的实时画面，GET /api/screen?target=X 返回 {screen}。 */
+  screenProvider?: (target: string) => Promise<string>;
 }
 
 export function serveDashboard(
@@ -116,6 +118,22 @@ export function serveDashboard(
           const data = opts.statusProvider ? await opts.statusProvider() : {};
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(data));
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: String(err) }));
+        }
+      })();
+      return;
+    }
+
+    // 单个会话实时画面（不算心跳活动）
+    if (url.pathname === '/api/screen') {
+      void (async () => {
+        try {
+          const target = url.searchParams.get('target') ?? '';
+          const screen = opts.screenProvider ? await opts.screenProvider(target) : '';
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ screen }));
         } catch (err) {
           res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: String(err) }));
@@ -226,6 +244,7 @@ const DASHBOARD_HTML = `<!doctype html>
   <button id="closeBtn">关闭 Dashboard</button>
 </header>
 <div id="status"></div>
+<div class="sec" style="border-bottom:none;padding-bottom:0"><h3>💬 对话与事件（飞书消息 + 任务输出）</h3></div>
 <div id="log"></div>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
@@ -339,12 +358,16 @@ function renderStatus(d) {
 
   if (d.sessions?.length) {
     const sec = el('div', 'sec');
-    sec.appendChild(el('h3', null, '🖥 终端会话 (' + d.sessions.length + ')'));
+    sec.appendChild(el('h3', null, '🖥 终端会话（实时画面，2s 刷新） (' + d.sessions.length + ')'));
     for (const s of d.sessions) {
       const tag = s.kind === 'tmux' ? 'tmux' : (s.injectable ? 'pts 仅注入' : 'pts 仅发现');
       sec.appendChild(el('div', 'item', '• ' + s.name + '  '));
       sec.lastChild.appendChild(el('span', 'meta', s.cwd + '　[' + tag + ']'));
-      if (s.screen) sec.appendChild(el('pre', null, s.screen));
+      if (s.kind === 'tmux') {
+        const pre = el('pre', 'live-screen', s.screen || '（加载中…）');
+        pre.dataset.target = s.target;
+        sec.appendChild(pre);
+      }
     }
     statusEl.appendChild(sec);
   }
@@ -368,6 +391,21 @@ async function refreshStatus() {
 }
 setInterval(refreshStatus, 5000);
 refreshStatus();
+
+// tmux 会话实时画面：每 2s 逐屏刷新（capture-pane 渲染后的干净文本）
+async function refreshScreens() {
+  for (const pre of document.querySelectorAll('pre.live-screen')) {
+    if (!pre.isConnected) continue;
+    try {
+      const r = await fetch('/api/screen?target=' + encodeURIComponent(pre.dataset.target) + '&token=' + encodeURIComponent(token));
+      if (r.ok) {
+        const d = await r.json();
+        pre.textContent = d.screen || '（空）';
+      }
+    } catch {}
+  }
+}
+setInterval(refreshScreens, 2000);
 </script>
 </body>
 </html>

@@ -156,6 +156,15 @@ export class Bridge {
         idleNopageMs: this.cfg.dashboardIdleTimeoutNopage * 1000,
         onClose: (reason) => void this.onDashboardClosed(reason),
         statusProvider: () => this.dashboardStatus(),
+        screenProvider: async (target) => {
+          // 只允许抓 tmux 窗格（%N 格式）；其余目标拒绝
+          if (!target || !/^%\d+$/.test(target)) return '';
+          try {
+            return await captureTmux(target, 40);
+          } catch {
+            return '(会话已退出或不可读)';
+          }
+        },
       });
       this.dashToken = token;
     }
@@ -190,7 +199,7 @@ export class Bridge {
             screen = '(读取失败)';
           }
         }
-        return { name: s.name, kind: s.kind, cwd: s.cwd, injectable: s.injectable, screen };
+        return { name: s.name, kind: s.kind, cwd: s.cwd, injectable: s.injectable, target: s.target, screen };
       }),
     );
     return {

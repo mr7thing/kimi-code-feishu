@@ -502,6 +502,7 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
     const srv = await serveDashboard(dash, '127.0.0.1', port, 'tok123', {
       idlePageMs: 600_000, idleNopageMs: 600_000, onClose: () => {},
       statusProvider: () => ({ marker: 'st-1' }),
+      screenProvider: () => Promise.resolve('scr-1'),
     });
     const base = `http://127.0.0.1:${port}`;
 
@@ -523,6 +524,10 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
     const status = (await r4.json()) as { sessions?: unknown[]; marker?: string };
     check('Dashboard: /api/status 返回状态面板数据', r4.status === 200 && status.marker === 'st-1');
     check('Dashboard: 页面含状态区', html.includes('id="status"'));
+
+    const r5 = await fetch(`${base}/api/screen?target=%251&token=tok123`);
+    const screen = (await r5.json()) as { screen?: string };
+    check('Dashboard: /api/screen 返回会话画面', r5.status === 200 && screen.screen === 'scr-1');
 
     const hb = await fetch(`${base}/heartbeat?token=tok123`, { method: 'POST' });
     check('Dashboard: 心跳保活 204', hb.status === 204);
