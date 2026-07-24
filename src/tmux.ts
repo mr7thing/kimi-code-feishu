@@ -91,6 +91,9 @@ async function processTable(): Promise<ProcInfo[]> {
 
 function findKimiDescendant(procs: ProcInfo[], rootPid: number, depth = 0): ProcInfo | undefined {
   if (depth > 8) return undefined;
+  // pane 根进程本身就是 kimi（tmux 用 sh -c 启动，单命令会被 exec 掉）
+  const root = procs.find((p) => p.pid === rootPid);
+  if (root && isKimiProc(root)) return root;
   for (const p of procs) {
     if (p.ppid !== rootPid) continue;
     if (isKimiProc(p)) return p;

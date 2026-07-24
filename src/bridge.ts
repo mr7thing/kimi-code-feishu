@@ -146,24 +146,24 @@ export class Bridge {
   // ================================================================
   // Dashboard 生命周期：飞书 /dashboard 命令按需开启，闲置自动关闭
   // ================================================================
-  /** 开启 dashboard（幂等，已开则直接返回当前链接）。返回带 token 的完整 URL。 */
-  async openDashboard(chatId: string): Promise<string> {
+  /** 开启 dashboard（幂等；opts.tunnel=true 时才拉 cloudflared 公网隧道，默认只开本地）。 */
+  async openDashboard(chatId: string, opts: { tunnel?: boolean } = {}): Promise<string> {
     this.dashChat = chatId;
-    if (this.dashServer) return this.dashboardUrl()!;
+    if (!this.dashServer) {
+      const token = crypto.randomBytes(8).toString('hex');
+      this.dashServer = await serveDashboard(this.dashboardBus, this.cfg.dashboardHost, this.cfg.dashboardPort, token, {
+        idlePageMs: this.cfg.dashboardIdleTimeoutPage * 1000,
+        idleNopageMs: this.cfg.dashboardIdleTimeoutNopage * 1000,
+        onClose: (reason) => void this.onDashboardClosed(reason),
+        statusProvider: () => this.dashboardStatus(),
+      });
+      this.dashToken = token;
+    }
 
-    const token = crypto.randomBytes(8).toString('hex');
-    this.dashServer = await serveDashboard(this.dashboardBus, this.cfg.dashboardHost, this.cfg.dashboardPort, token, {
-      idlePageMs: this.cfg.dashboardIdleTimeoutPage * 1000,
-      idleNopageMs: this.cfg.dashboardIdleTimeoutNopage * 1000,
-      onClose: (reason) => void this.onDashboardClosed(reason),
-      statusProvider: () => this.dashboardStatus(),
-    });
-    this.dashToken = token;
-
-    // 公网地址：优先固定配置（named tunnel），否则临时拉 quick tunnel，失败回退局域网
+    // 公网：显式配置（named tunnel）优先；opts.tunnel 时才临时拉 quick tunnel（server/token 不变）
     if (this.cfg.dashboardPublicUrl) {
       this.dashPublic = this.cfg.dashboardPublicUrl.replace(/\/+$/, '');
-    } else {
+    } else if (opts.tunnel && !this.tunnel) {
       this.tunnel = (await startCloudflaredTunnel(this.cfg.cloudflaredBin, this.cfg.dashboardPort)) ?? undefined;
       if (!this.tunnel) console.warn('[bridge] cloudflared 不可用，dashboard 只有局域网链接');
     }
@@ -644,14 +644,19 @@ export class Bridge {
         }
         return;
       }
-      await this.channel.sendText(chatId, '⏳ 正在开启 Dashboard（拉起隧道，约几秒）…');
+      const wantTunnel = ['public', 'pub', 'tunnel'].includes(arg.toLowerCase());
+      await this.channel.sendText(chatId, wantTunnel ? '⏳ 正在开启 Dashboard（拉起公网隧道，约几秒）…' : '⏳ 正在开启 Dashboard…');
       try {
-        const url = await this.openDashboard(chatId);
-        const pub = this.dashPublic ?? this.tunnel?.url;
+        const url = await this.openDashboard(chatId, { tunnel: wantTunnel });
+        const isPublic = !!(this.dashPublic ?? this.tunnel?.url);
         await this.channel.sendText(
           chatId,
           `📊 Dashboard 已开启：\n${url}\n页面只读，可手动关闭；无人观看约 ${Math.round(this.cfg.dashboardIdleTimeoutNopage / 60)} 分钟、停看 ${Math.round(this.cfg.dashboardIdleTimeoutPage / 60)} 分钟自动关闭` +
-            (pub ? '' : '\n⚠️ cloudflared 不可用，此为局域网链接（公网访问需安装 cloudflared）'),
+            (wantTunnel && !isPublic
+              ? '\n⚠️ cloudflared 不可用，回退为局域网链接'
+              : isPublic
+                ? ''
+                : '\n（本地/局域网链接；要公网链接发 /dashboard public）'),
         );
       } catch (err) {
         await this.channel.sendText(chatId, `❌ 开启 Dashboard 失败：${err instanceof Error ? err.message : err}`);
@@ -911,7 +916,7 @@ export const HELP_TEXT = `🤖 kimi-code-feishu 使用指南
 /new          开启新会话（默认会续接上次会话）
 /stop         终止正在执行的任务
 /status       查看当前状态
-/dashboard    临时开启实时输出面板（/dashboard off 关闭）
+/dashboard    临时开启实时输出面板（默认本地链接；/dashboard public 开公网隧道；/dashboard off 关闭）
 /a            列出终端 tmux 会话；/a 序号 绑定到本聊天
 /t <文本>     向绑定会话注入文本+回车（空文本=只回车）
 /i <文本>     优先插话：绑定会话=Ctrl+S 立即插入；运行中任务=打断带前缀重启

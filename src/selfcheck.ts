@@ -331,8 +331,11 @@ async function main(): Promise<void> {
     cfg.dashboardPort = await freePort();
 
     await bridge.onFeishuMessage('chat-1', 'ou_boss', '/dashboard');
-    check('Dashboard命令: 开启返回隧道链接',
-      channel.texts().some((t) => t.includes('已开启') && t.includes('fake-tunnel-xyz.trycloudflare.com')));
+    check('Dashboard命令: 默认开启本地链接',
+      channel.texts().some((t) => t.includes('已开启') && t.includes('127.0.0.1') && !t.includes('trycloudflare')));
+
+    await bridge.onFeishuMessage('chat-1', 'ou_boss', '/dashboard public');
+    check('Dashboard命令: public 开启隧道链接', channel.texts().some((t) => t.includes('fake-tunnel-xyz.trycloudflare.com')));
 
     const linkApprover = (async () => {
       for (let i = 0; i < 50; i++) {
@@ -614,6 +617,20 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
         state.setAttach('chat-t', 'pts|/dev/pts/99');
         await bridge.onFeishuMessage('chat-t', 'ou_boss', '/t hello');
         check('命令: pts 会话 /t 有明确反馈', channel.texts().some((t) => t.includes('无法注入') || t.includes('注入失败')));
+
+        // 去重：tmux pane 根进程就是 kimi 时（sh -c exec），不能同时再列一个 pts 条目
+        const dupSess = 'kcf-dup';
+        fs.symlinkSync('/bin/cat', path.join(tmp, 'kimi'));
+        await execFileP('tmux', ['new-session', '-d', '-s', dupSess, path.join(tmp, 'kimi')]);
+        try {
+          await sleep(400);
+          const list2 = await listKimiSessions();
+          const tmuxEntry = list2.find((s) => s.name === dupSess);
+          check('tmux: pane 根进程是 kimi 时识别出 pid', !!tmuxEntry && typeof tmuxEntry.pid === 'number');
+          check('tmux: 同一会话不重复列为 pts', !list2.some((s) => s.kind === 'pts' && s.pid === tmuxEntry?.pid));
+        } finally {
+          await execFileP('tmux', ['kill-session', '-t', dupSess]).catch(() => {});
+        }
 
         // pts 真注入（需要 legacy_tiocsti=1 + 免密 sudo；不满足则跳过）
         if (await canInjectPts()) {
