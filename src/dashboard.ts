@@ -12,7 +12,7 @@
  */
 import http from 'node:http';
 
-export type DashKind = 'stdout' | 'stderr' | 'lifecycle' | 'progress' | 'in' | 'out';
+export type DashKind = 'stdout' | 'stderr' | 'lifecycle' | 'progress' | 'in' | 'out' | 'session';
 
 export interface DashEvent {
   ts: number;
@@ -233,6 +233,7 @@ const DASHBOARD_HTML = `<!doctype html>
   .progress .text { color: #6bcbff; }
   .in .text { color: #b5e853; }
   .out .text { color: #8cc8ff; }
+  .session .text { color: #c586c0; }
   .hide { display: none; }
 </style>
 </head>

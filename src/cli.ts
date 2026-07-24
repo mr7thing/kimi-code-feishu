@@ -231,6 +231,7 @@ async function cmdRun(args: string[]): Promise<number> {
   });
   console.log('正在退出…');
   bridge.runner.stopAll();
+  bridge.wires.stopAll();
   await channel.close();
   await hookServer.close();
   return 0;

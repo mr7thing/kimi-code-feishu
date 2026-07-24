@@ -21,6 +21,7 @@ import { serveHooks } from './hookServer.js';
 import * as installer from './installer.js';
 import { StateStore } from './state.js';
 import { parseLine } from './streamParser.js';
+import { renderWireLine, WireWatcher } from './sessionWire.js';
 import { canInjectPts, captureTmux, listKimiSessions, sendPtsText, sendTmuxCtrlS, sendTmuxText } from './tmux.js';
 import type { Channel } from './channel.js';
 
@@ -710,6 +711,36 @@ while time.time() < end:
     const feed = bridge.dashboardBus.snapshot();
     check('日志: 入站消息进 dashboard feed', feed.some((e) => e.kind === 'in' && e.text.includes('👤') && e.text.includes('/id')));
     check('日志: 出站回复进 dashboard feed', feed.some((e) => e.kind === 'out' && e.text.includes('🤖')));
+  }
+
+  // ---------------------------------------------------------------- 12. 会话转录（wire.jsonl）
+  {
+    check('转录: 渲染用户消息', renderWireLine('{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"你好"}]}}') === '👤 你好');
+    check('转录: 渲染思考/文本/工具',
+      renderWireLine('{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"think","think":"想想"}}}') === '💭 想想' &&
+      renderWireLine('{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"答复"}}}') === '🤖 答复' &&
+      (renderWireLine('{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Bash","args":{"command":"ls -la"}}}') ?? '').includes('ls -la'));
+    check('转录: 渲染工具结果', (renderWireLine('{"type":"context.append_loop_event","event":{"type":"tool.result","result":{"output":"file1"}}}') ?? '').includes('file1'));
+    check('转录: 跳过 llm.request', renderWireLine('{"type":"llm.request","kind":"loop"}') === null);
+
+    // WireWatcher：假 sessions 目录，增量读取
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kcf-wire-'));
+    const wireFile = path.join(tmp, 'wd_x', 'session_test1', 'agents', 'main');
+    fs.mkdirSync(wireFile, { recursive: true });
+    const wf = path.join(wireFile, 'wire.jsonl');
+    fs.writeFileSync(wf, '{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"历史消息"}]}}\n');
+    const watcher = new WireWatcher(tmp);
+    const got: string[] = [];
+    const okWatch = await watcher.watch('session_test1', (l) => got.push(l));
+    fs.appendFileSync(wf, '{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"新回复"}}}\n');
+    let pumped = false;
+    for (let i = 0; i < 30; i++) {
+      if (got.some((l) => l.includes('新回复'))) { pumped = true; break; }
+      await sleep(200);
+    }
+    check('转录: watcher 回放历史', okWatch && got.some((l) => l.includes('历史消息')));
+    check('转录: watcher 增量推送', pumped);
+    watcher.stopAll();
   }
 
   // ---------------------------------------------------------------- 汇总

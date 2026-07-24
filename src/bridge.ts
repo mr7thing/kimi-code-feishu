@@ -16,6 +16,7 @@ import path from 'node:path';
 import { Dashboard, serveDashboard, type DashboardServer, type DashKind } from './dashboard.js';
 import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
+import { WireWatcher } from './sessionWire.js';
 import type { StreamEvent } from './streamParser.js';
 import { startCloudflaredTunnel, type TunnelHandle } from './tunnel.js';
 import { canInjectPts, captureTmux, listKimiSessions, sendPtsCtrlS, sendPtsKeys, sendPtsText, sendTmuxCtrlS, sendTmuxKeys, sendTmuxText } from './tmux.js';
@@ -116,6 +117,7 @@ export class Bridge {
   private tunnel?: TunnelHandle;
   private dashChat?: string;
   private auqPending = new Map<string, PendingAuq>();
+  readonly wires = new WireWatcher();
 
   constructor(
     private cfg: Config,
@@ -522,6 +524,11 @@ export class Bridge {
     // 桥自己拉起的任务已由 stream-json 覆盖进度，避免重复刷屏
     if (this.runner.isBusy(chatId)) return;
     if (!this.cfg.forwardTerminalSessions) return;
+
+    // 本地会话转录（wire.jsonl）流式进 dashboard：终端会话的完整对话
+    if (sessionId) {
+      void this.wires.watch(sessionId, (line) => this.dashboardBus.publish(chatId, 'session', line));
+    }
 
     const tool = String(payload.tool_name ?? '');
     const key = sessionId || cwd || 'default';
