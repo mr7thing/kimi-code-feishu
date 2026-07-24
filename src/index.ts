@@ -6,6 +6,7 @@ export * from './streamParser.js';
 export * from './channel.js';
 export * from './bridge.js';
 export * from './installer.js';
-export * from './kimiRunner.js';
+export * from './chatSession.js';
+export * from './sessionWire.js';
 export { FeishuChannel } from './feishuChannel.js';
 export { serveHooks } from './hookServer.js';

@@ -230,7 +230,7 @@ async function cmdRun(args: string[]): Promise<number> {
     process.on('SIGTERM', () => resolve());
   });
   console.log('正在退出…');
-  bridge.runner.stopAll();
+  await bridge.chatSessions.stopAll();
   bridge.wires.stopAll();
   await channel.close();
   await hookServer.close();

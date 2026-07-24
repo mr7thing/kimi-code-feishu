@@ -30,8 +30,14 @@ function toolArgsBrief(args: unknown): string {
   return '';
 }
 
-/** wire.jsonl 一行 → dashboard 一行；不关心的类型返回 null。 */
-export function renderWireLine(line: string): string | null {
+/** wire.jsonl 一行 → 结构化事件；不关心的类型返回 null。 */
+export interface WireEvent {
+  kind: 'user' | 'think' | 'text' | 'tool_call' | 'tool_result' | 'steer' | 'cancel';
+  text: string;
+  tool?: string;
+}
+
+export function parseWireLine(line: string): WireEvent | null {
   const s = line.trim();
   if (!s) return null;
   let e: Record<string, unknown>;
@@ -46,7 +52,7 @@ export function renderWireLine(line: string): string | null {
     const msg = e.message as Record<string, unknown> | undefined;
     if (msg?.role !== 'user') return null;
     const text = contentText(msg.content);
-    return text ? `👤 ${trunc(text, 200)}` : null;
+    return text ? { kind: 'user', text } : null;
   }
 
   if (t === 'context.append_loop_event') {
@@ -54,29 +60,51 @@ export function renderWireLine(line: string): string | null {
     const et = String(ev?.type ?? '');
     if (et === 'content.part') {
       const part = ev?.part as Record<string, unknown> | undefined;
-      if (part?.type === 'think') return `💭 ${trunc(String(part.think ?? ''), 150)}`;
-      if (part?.type === 'text') return `🤖 ${trunc(String(part.text ?? ''), 300)}`;
+      if (part?.type === 'think') return { kind: 'think', text: String(part.think ?? '') };
+      if (part?.type === 'text') return { kind: 'text', text: String(part.text ?? '') };
       return null;
     }
     if (et === 'tool.call') {
-      return `🔧 ${String(ev?.name ?? '?')}${toolArgsBrief(ev?.args) ? `：${toolArgsBrief(ev?.args)}` : ''}`;
+      const name = String(ev?.name ?? '?');
+      return { kind: 'tool_call', text: toolArgsBrief(ev?.args), tool: name };
     }
     if (et === 'tool.result') {
       const out = String((ev?.result as Record<string, unknown>)?.output ?? '');
-      return out.trim() ? `📎 ${trunc(out.replace(/\s+/g, ' '), 120)}` : null;
+      return out.trim() ? { kind: 'tool_result', text: out.replace(/\s+/g, ' ') } : null;
     }
     return null;
   }
 
-  if (t === 'turn.steer') return '⚡ 用户插话干预';
-  if (t === 'turn.cancel') return '⛔ 本轮被取消';
+  if (t === 'turn.steer') return { kind: 'steer', text: '用户插话干预' };
+  if (t === 'turn.cancel') return { kind: 'cancel', text: '本轮被取消' };
   return null;
+}
+
+const WIRE_ICON: Record<WireEvent['kind'], string> = {
+  user: '👤', think: '💭', text: '🤖', tool_call: '🔧', tool_result: '📎', steer: '⚡', cancel: '⛔',
+};
+
+/** wire.jsonl 一行 → dashboard 一行；不关心的类型返回 null。 */
+export function renderWireLine(line: string): string | null {
+  const ev = parseWireLine(line);
+  if (!ev) return null;
+  const limit = ev.kind === 'text' ? 300 : ev.kind === 'user' ? 200 : 150;
+  const tool = ev.tool ? `${ev.tool}${ev.text ? `：${trunc(ev.text, 120)}` : ''}` : trunc(ev.text, limit);
+  return `${WIRE_ICON[ev.kind]} ${tool}`;
 }
 
 interface WatchEntry {
   sessionId: string;
   timer: NodeJS.Timeout;
   offset: number;
+  cbs: Set<(ev: WireEvent) => void>;
+}
+
+/** 结构化 wire 事件 → dashboard 文本行。 */
+export function renderWireEvent(ev: WireEvent): string {
+  const limit = ev.kind === 'text' ? 300 : ev.kind === 'user' ? 200 : 150;
+  const body = ev.tool ? `${ev.tool}${ev.text ? `：${trunc(ev.text, 120)}` : ''}` : trunc(ev.text, limit);
+  return `${WIRE_ICON[ev.kind]} ${body}`;
 }
 
 /** 按 cwd 定位某工作目录下最近活跃的 wire 文件（wd_<basename>_* 下 mtime 最新）。 */
@@ -136,20 +164,36 @@ export class WireWatcher {
   }
 
 
-  /** 开始监听某会话的 wire 转录（幂等）。找不到转录文件返回 false。 */
-  async watch(sessionId: string, cb: (line: string) => void): Promise<boolean> {
-    if (!sessionId || this.watches.has(sessionId)) return this.watches.has(sessionId);
+  /** 开始监听某会话的 wire 转录（同一会话可多订阅；找不到转录文件返回 false）。 */
+  async watch(sessionId: string, cb: (ev: WireEvent) => void): Promise<boolean> {
+    const existing = this.watches.get(sessionId);
+    if (existing) {
+      existing.cbs.add(cb);
+      return true;
+    }
+    if (!sessionId) return false;
     const file = this.findWirePath(sessionId);
     if (!file) return false;
 
+    const entry: WatchEntry = { sessionId, timer: null as unknown as NodeJS.Timeout, offset: 0, cbs: new Set([cb]) };
     // 首次回放慢最近 15 条（从文件尾 64KB 里解析）
-    this.backfill(file, cb);
+    this.backfill(file, entry.cbs);
 
-    const offset = fs.statSync(file).size;
-    const timer = setInterval(() => this.pump(sessionId, file, cb), 1500);
-    timer.unref();
-    this.watches.set(sessionId, { sessionId, timer, offset });
+    entry.offset = fs.statSync(file).size;
+    entry.timer = setInterval(() => this.pump(sessionId, file), 1500);
+    entry.timer.unref();
+    this.watches.set(sessionId, entry);
     return true;
+  }
+
+  private emit(cbs: Set<(ev: WireEvent) => void>, ev: WireEvent, prefix = ''): void {
+    for (const cb of cbs) {
+      try {
+        cb(prefix ? { ...ev, text: prefix + ev.text } : ev);
+      } catch {
+        /* 订阅者异常不影响其他 */
+      }
+    }
   }
 
   private findWirePath(sessionId: string): string | null {
@@ -164,7 +208,7 @@ export class WireWatcher {
     return null;
   }
 
-  private backfill(file: string, cb: (line: string) => void): void {
+  private backfill(file: string, cbs: Set<(ev: WireEvent) => void>): void {
     try {
       const stat = fs.statSync(file);
       const start = Math.max(0, stat.size - 64 * 1024);
@@ -172,18 +216,18 @@ export class WireWatcher {
       const fd = fs.openSync(file, 'r');
       fs.readSync(fd, buf, 0, buf.length, start);
       fs.closeSync(fd);
-      const lines = buf
+      const events = buf
         .toString('utf-8')
         .split('\n')
-        .map(renderWireLine)
-        .filter((l): l is string => !!l);
-      for (const l of lines.slice(-15)) cb('⏪ ' + l);
+        .map(parseWireLine)
+        .filter((l): l is WireEvent => !!l);
+      for (const ev of events.slice(-15)) this.emit(cbs, ev, '⏪ ');
     } catch {
       /* 回放失败不阻塞 */
     }
   }
 
-  private pump(sessionId: string, file: string, cb: (line: string) => void): void {
+  private pump(sessionId: string, file: string): void {
     const w = this.watches.get(sessionId);
     if (!w) return;
     try {
@@ -195,8 +239,8 @@ export class WireWatcher {
       fs.closeSync(fd);
       w.offset = size;
       for (const line of buf.toString('utf-8').split('\n')) {
-        const rendered = renderWireLine(line);
-        if (rendered) cb(rendered);
+        const ev = parseWireLine(line);
+        if (ev) this.emit(w.cbs, ev);
       }
     } catch {
       /* 读取失败下轮再试 */

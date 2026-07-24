@@ -419,36 +419,43 @@ async function main(): Promise<void> {
     check('fail_closed: 桥不可达时拒绝', isDeny(r.stdout));
   }
 
-  // ---------------------------------------------------------------- 7. 假 kimi 任务全流程
+  // ---------------------------------------------------------------- 7. 飞书会话（0号）全流程
   {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kcf-task-'));
+    const sessDir = path.join(tmp, 'sessions');
     const fakeKimi = path.join(tmp, 'fake_kimi');
-    // 用真实 stream-json 格式（role 风格）输出，覆盖与线上一致的解析路径
+    // 假交互 kimi：每收到一行输入就写一轮 wire 转录事件（模拟 prompt → 事件流）
     fs.writeFileSync(fakeKimi, `#!/bin/sh
-echo '{"role":"assistant","content":"正在分析…","tool_calls":[{"type":"function","function":{"name":"Bash"}}]}'
-echo '{"role":"tool","tool_call_id":"t1","content":"ok"}'
-echo '{"role":"assistant","content":"完成：一切正常"}'
+D="${sessDir}/wd_fake_x/session_fake1/agents/main"
+mkdir -p "$D"
+cat | while IFS= read -r line; do
+  echo '{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"think","think":"分析中"}}}' >> "$D/wire.jsonl"
+  echo '{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Bash","args":{"command":"ls"}}}' >> "$D/wire.jsonl"
+  echo '{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"完成：一切正常"}}}' >> "$D/wire.jsonl"
+done
 `, 'utf-8');
     fs.chmodSync(fakeKimi, 0o755);
 
     const cfgPath = makeConfig(tmp, await freePort());
     const cfg = loadConfig(cfgPath);
     cfg.kimiBin = fakeKimi;
+    cfg.kimiSessionsDir = sessDir;
     const state = new StateStore(path.join(tmp, 'state.json'));
     const channel = new FakeChannel();
     const bridge = new Bridge(cfg, state, channel);
+    bridge.chatSessions.turnEndMs = 800;
 
     await bridge.onFeishuMessage('chat-9', 'ou_boss', '检查一下项目');
     let done = false;
-    for (let i = 0; i < 60; i++) {
-      if (channel.texts().some((t) => t.includes('任务完成') && t.includes('一切正常'))) { done = true; break; }
-      await sleep(200);
+    for (let i = 0; i < 40; i++) {
+      if (channel.texts().some((t) => t.includes('本轮完成') && t.includes('一切正常'))) { done = true; break; }
+      await sleep(300);
     }
-    check('任务: 流式执行并回报结果', done);
-    check('任务: 会话标记已置位', state.hasSession('chat-9'));
-    check('任务: 有执行中消息', channel.texts().some((t) => t.includes('执行中') || t.includes('已开工')));
-    check('任务: 进度消息被更新（工具行）', channel.updated.length >= 1);
-    check('任务: 工具返回不混入最终结果', !channel.texts().some((t) => t.includes('任务完成') && t.includes('ok')));
+    check('会话: wire 转录驱动轮次结果', done);
+    check('会话: 会话标记已置位', state.hasSession('chat-9'));
+    check('会话: 有执行中消息', channel.texts().some((t) => t.includes('执行中')));
+    check('会话: 进度消息被更新（工具行）', channel.updated.length >= 1);
+    await bridge.chatSessions.stopAll();
   }
 
   // ---------------------------------------------------------------- 8. 扫码注册流程（mock accounts 服务）
@@ -618,38 +625,44 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
         await sleep(300);
         check('终端模式: 纯文本自动注入会话', (await captureTmux(target, 5)).includes('hello-auto-inject'));
 
-        // 终端模式：桥不认识的 /命令 透传注入（如 /model）
+        // 终端模式：终端 /命令 一律 /t 注入，桥未识别的 /命令 不透传
         await bridge.onFeishuMessage('chat-t', 'ou_boss', '/model');
+        check('终端模式: 未知 /命令 提示用 /t', channel.texts().some((t) => t.includes('未知命令') && t.includes('/t')));
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/t /model');
         await sleep(300);
-        check('终端模式: 未识别的 /命令 透传注入', (await captureTmux(target, 5)).includes('/model'));
+        check('终端模式: /t 注入终端 /命令', (await captureTmux(target, 5)).includes('/model'));
 
-        // /task 显式派任务（绑定不影响）；随后 /a free 释放
-        const fakeSleep = path.join(tmp, 'fake_sleep');
-        fs.writeFileSync(fakeSleep, '#!/bin/sh\nsleep 30\n', 'utf-8');
-        fs.chmodSync(fakeSleep, 0o755);
-        cfg.kimiBin = fakeSleep;
-        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/task 跑个东西');
-        await sleep(300);
-        check('终端模式: /task 显式派任务', bridge.runner.isBusy('chat-t') && channel.texts().some((t) => t.includes('已开工')));
-        bridge.runner.stopAll();
+        // /0 与 /i steer：fake kimi（cat）跑在飞书会话里
+        const tmp3 = fs.mkdtempSync(path.join(os.tmpdir(), 'kcf-chatsess-'));
+        const fakeCat = path.join(tmp3, 'fake_kimi');
+        fs.writeFileSync(fakeCat, '#!/bin/sh\ncat\n', 'utf-8');
+        fs.chmodSync(fakeCat, 0o755);
+        const cfg3 = loadConfig(makeConfig(tmp3, await freePort()));
+        cfg3.kimiBin = fakeCat;
+        cfg3.kimiSessionsDir = path.join(tmp3, 'sessions');
+        const state3 = new StateStore(path.join(tmp3, 'state.json'));
+        const channel3 = new FakeChannel();
+        const bridge3 = new Bridge(cfg3, state3, channel3);
+        bridge3.chatSessions.turnEndMs = 800;
+
+        await bridge3.onFeishuMessage('chat-f', 'ou_boss', '你好飞书会话');
+        await sleep(600);
+        const chatTarget = bridge3.chatSessions.targetOf('chat-f');
+        check('飞书会话: 常驻 tmux 会话拉起并接收注入',
+          !!chatTarget && (await captureTmux(chatTarget, 5)).includes('你好飞书会话'));
+
+        await bridge3.onFeishuMessage('chat-f', 'ou_boss', '/0 再来一句');
+        await sleep(400);
+        check('命令: /0 发到飞书会话', !!chatTarget && (await captureTmux(chatTarget, 10)).includes('再来一句'));
+
+        await bridge3.onFeishuMessage('chat-f', 'ou_boss', '/i 优先做这个');
+        await sleep(400);
+        check('命令: /i 向飞书会话插话(Ctrl+S)', !!chatTarget && (await captureTmux(chatTarget, 10)).includes('优先做这个'));
+        if (chatTarget) await execFileP('tmux', ['send-keys', '-t', chatTarget, 'C-q']).catch(() => {});
+        await bridge3.chatSessions.stopAll();
 
         await bridge.onFeishuMessage('chat-t', 'ou_boss', '/a free');
         check('命令: /a free 释放绑定', state.getAttach('chat-t') === null);
-
-        // /i 优先插话（桥任务路径：打断带前缀重启）
-        state.setAttach('chat-t', null);
-        const fakeKimi = path.join(tmp, 'fake_kimi_sleep');
-        fs.writeFileSync(fakeKimi, '#!/bin/sh\nsleep 30\n', 'utf-8');
-        fs.chmodSync(fakeKimi, 0o755);
-        cfg.kimiBin = fakeKimi;
-        await bridge.onFeishuMessage('chat-t', 'ou_boss', '跑个长任务');
-        await sleep(300);
-        check('命令: /i 前提任务在运行', bridge.runner.isBusy('chat-t'));
-        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/i 优先做这个');
-        await sleep(300);
-        check('命令: /i 打断并插入优先指令',
-          channel.texts().some((t) => t.includes('插入优先指令')) && bridge.runner.isBusy('chat-t'));
-        bridge.runner.stopAll();
 
         // pts（非 tmux）绑定：可注入则真注入，否则给提示
         state.setAttach('chat-t', 'pts|/dev/pts/99');
@@ -763,7 +776,7 @@ while time.time() < end:
     fs.writeFileSync(wf, '{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"历史消息"}]}}\n');
     const watcher = new WireWatcher(tmp);
     const got: string[] = [];
-    const okWatch = await watcher.watch('session_test1', (l) => got.push(l));
+    const okWatch = await watcher.watch('session_test1', (ev) => got.push(ev.text));
     fs.appendFileSync(wf, '{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"新回复"}}}\n');
     let pumped = false;
     for (let i = 0; i < 30; i++) {

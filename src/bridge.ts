@@ -10,13 +10,13 @@ import type { Approval, ApprovalManager as AM } from './approvals.js';
 import { ApprovalManager } from './approvals.js';
 import type { Channel } from './channel.js';
 import { ChatLogger, type LogDir } from './chatLogger.js';
+import { ChatSessionManager } from './chatSession.js';
 import type { Config } from './config.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { Dashboard, serveDashboard, type DashboardServer, type DashKind } from './dashboard.js';
-import { KimiRunner, type ChatTask } from './kimiRunner.js';
 import type { StateStore } from './state.js';
-import { WireWatcher } from './sessionWire.js';
+import { WireWatcher, renderWireEvent, type WireEvent } from './sessionWire.js';
 import type { StreamEvent } from './streamParser.js';
 import { startCloudflaredTunnel, type TunnelHandle } from './tunnel.js';
 import { canInjectPts, captureTmux, listKimiSessions, sendPtsCtrlS, sendPtsKeys, sendPtsText, sendTmuxCtrlS, sendTmuxKeys, sendTmuxText } from './tmux.js';
@@ -102,7 +102,7 @@ interface ProgressState {
 
 export class Bridge {
   approvals = new ApprovalManager();
-  runner: KimiRunner;
+  readonly chatSessions: ChatSessionManager;
   channel!: Channel;
   private progress = new Map<string, ProgressState>();
   private taskMessages = new Map<string, string>();
@@ -117,7 +117,7 @@ export class Bridge {
   private tunnel?: TunnelHandle;
   private dashChat?: string;
   private auqPending = new Map<string, PendingAuq>();
-  readonly wires = new WireWatcher();
+  readonly wires: WireWatcher;
 
   constructor(
     private cfg: Config,
@@ -132,7 +132,13 @@ export class Bridge {
       const prefix = e.dir === 'in' ? '👤 ' : e.dir === 'out' ? '🤖 ' : '';
       this.dashboardBus.publish(e.chat, e.dir === 'sys' ? (e.kind as DashKind) : e.dir, prefix + e.text);
     };
-    this.runner = new KimiRunner(cfg, state, this, (chatId, kind, text) => this.publish(chatId, kind, text));
+    this.wires = new WireWatcher(cfg.kimiSessionsDir || undefined);
+    // 飞书聊天 = 桥托管的常驻 tmux 交互会话（编号 0）；wire 转录驱动进度与结果
+    this.chatSessions = new ChatSessionManager(state, this.wires, {
+      onStream: (chatId, ev) => this.onChatStream(chatId, ev),
+      onTurnDone: (chatId, text, tools) => void this.onChatTurnDone(chatId, text, tools),
+      onError: (chatId, message) => void this.channel.sendText(chatId, `❌ ${message}`),
+    }, cfg.kimiBin, cfg.kimiSessionsDir || undefined);
   }
 
   /** 日志（onEntry 进 dashboard；fileEnabled 时落盘；绝不抛错影响主流程）。 */
@@ -206,7 +212,7 @@ export class Bridge {
     );
     return {
       sessions: withScreens,
-      tasks: this.runner.activeTasks(),
+      tasks: this.chatSessions.activeTasks(),
       approvals: this.approvals.pendingList().map((ap) => ({
         reqId: ap.reqId,
         tool: ap.toolName,
@@ -274,7 +280,7 @@ export class Bridge {
 
     // 3.5) 终端会话未进审批池 → 放行回落终端原生权限（桥自己派的任务除外）
     const chatId = this.routeChat(payload);
-    const isBridgeTask = chatId ? this.runner.isBusy(chatId) : false;
+    const isBridgeTask = chatId ? this.chatSessions.has(chatId) : false;
     if (!isBridgeTask && !this.state.inPool(String(payload.cwd ?? ''))) {
       return { decision: 'allow', reason: '会话未进审批池，回落终端原生权限' };
     }
@@ -521,13 +527,13 @@ export class Bridge {
     if (sessionId && chatId) this.state.bindSession(sessionId, chatId);
     if (!chatId) return;
 
-    // 桥自己拉起的任务已由 stream-json 覆盖进度，避免重复刷屏
-    if (this.runner.isBusy(chatId)) return;
+    // 桥托管的会话（飞书聊天会话）已由 wire 转录覆盖进度，避免重复刷屏
+    if (this.chatSessions.has(chatId)) return;
     if (!this.cfg.forwardTerminalSessions) return;
 
     // 本地会话转录（wire.jsonl）流式进 dashboard：终端会话的完整对话
     if (sessionId) {
-      void this.wires.watch(sessionId, (line) => this.dashboardBus.publish(chatId, 'session', line));
+      void this.wires.watch(sessionId, (ev) => this.dashboardBus.publish(chatId, 'session', renderWireEvent(ev)));
     }
 
     const tool = String(payload.tool_name ?? '');
@@ -635,15 +641,15 @@ export class Bridge {
         return;
       }
       this.state.setWorkDir(chatId, arg);
-      this.state.setHasSession(chatId, false);
+      await this.chatSessions.reset(chatId);
       await this.channel.sendText(chatId, `📁 已绑定工作目录：\n\`${arg}\`\n（会话已重置，下一条消息开启新会话）`);
     } else if (cmd === '/new') {
-      this.state.setHasSession(chatId, false);
+      await this.chatSessions.reset(chatId);
       await this.channel.sendText(chatId, '🆗 已重置，下一条消息将开启新会话');
     } else if (cmd === '/stop') {
-      await this.channel.sendText(chatId, this.runner.stop(chatId) ? '🛑 已终止当前任务' : '当前没有正在运行的任务');
+      await this.channel.sendText(chatId, (await this.chatSessions.interrupt(chatId)) ? '🛑 已发送中断（Esc）' : '当前没有正在运行的会话');
     } else if (cmd === '/status') {
-      const busy = this.runner.isBusy(chatId);
+      const busy = this.chatSessions.isBusy(chatId);
       const wd = this.state.getWorkDir(chatId, this.cfg.workDir);
       const attach = this.state.getAttach(chatId);
       await this.channel.sendText(
@@ -795,9 +801,9 @@ export class Bridge {
         await this.channel.sendText(chatId, '❌ 读取画面失败（会话可能已退出），/a 重新选择');
       }
     } else if (cmd === '/i') {
-      // 优先插话：绑定会话 → 文本+Ctrl+S 立即插入运行轮次；桥任务 → 打断带前缀重启
+      // 优先插话：绑定终端会话 → 按键 Ctrl+S；飞书会话（0号） → steer 注入
       if (!arg) {
-        await this.channel.sendText(chatId, '用法：/i <文本>\n绑定会话：等同终端输入后按 Ctrl+S，立即插入运行中的轮次\n运行中任务：打断后带「优先处理」前缀立即重启');
+        await this.channel.sendText(chatId, '用法：/i <文本>\n绑定终端会话：等同终端输入后按 Ctrl+S，立即插入运行中的轮次\n飞书会话：同样 Ctrl+S 插话');
         return;
       }
       const attach = this.state.getAttach(chatId);
@@ -819,19 +825,30 @@ export class Bridge {
         }
         return;
       }
-      if (this.runner.isBusy(chatId)) {
-        this.runner.stop(chatId);
-        const ok = this.runner.submit(chatId, `[用户插话，请优先处理] ${arg}`);
-        await this.channel.sendText(chatId, ok ? `⚡ 已打断并插入优先指令：${truncate(arg, 80)}` : '❌ 插入失败');
+      if (this.chatSessions.has(chatId)) {
+        await this.chatSessions.steer(chatId, this.state.getWorkDir(chatId, this.cfg.workDir), arg);
+        this.publish(chatId, 'progress', `⚡ /i 优先插入(飞书会话)：${truncate(arg, 120)}`);
         return;
       }
-      await this.channel.sendText(chatId, '当前没有运行中的任务，也没有绑定的终端会话（/i 用于执行中插话）');
+      await this.channel.sendText(chatId, '当前没有运行中的会话，也没有绑定的终端会话（/i 用于执行中插话）');
     } else if (cmd === '/help') {
       await this.channel.sendText(chatId, HELP_TEXT);
-    } else if (cmd === '/task') {
-      await this.dispatchTask(chatId, arg);
+    } else if (cmd === '/0' || cmd === '/task') {
+      // /0 = 发给 0 号会话（飞书本身的常驻会话）；/task 为其旧别名
+      if (!arg) {
+        await this.channel.sendText(chatId, '用法：/0 <文本>（发给飞书会话本身，即 0 号会话）');
+        return;
+      }
+      try {
+        await this.chatSessions.send(chatId, this.state.getWorkDir(chatId, this.cfg.workDir), arg);
+      } catch (err) {
+        await this.channel.sendText(chatId, `❌ 拉起飞书会话失败：${err instanceof Error ? err.message : err}`);
+      }
+    } else if (cmdRaw.startsWith('/')) {
+      // 其余 /命令 不再透传：终端命令一律 /t 注入
+      await this.channel.sendText(chatId, `❓ 未知命令 ${cmdRaw}。飞书命令见 /help；要执行终端的 /命令 请用 /t ${cmdRaw}`);
     } else {
-      // 绑定终端会话时：纯文本自动注入该会话（终端模式）；否则派飞书任务
+      // 绑定终端会话时：纯文本自动注入该会话（终端模式）；否则发到飞书会话（0 号）
       const attach = this.state.getAttach(chatId);
       if (attach) {
         const { kind, target: pane } = parseAttach(attach);
@@ -851,42 +868,37 @@ export class Bridge {
         }
         return;
       }
-      await this.dispatchTask(chatId, text);
+      try {
+        await this.chatSessions.send(chatId, this.state.getWorkDir(chatId, this.cfg.workDir), text);
+      } catch (err) {
+        await this.channel.sendText(chatId, `❌ 拉起飞书会话失败：${err instanceof Error ? err.message : err}`);
+      }
     }
   }
 
-  /** 派发桥任务（kimi -p）。 */
-  private async dispatchTask(chatId: string, text: string): Promise<void> {
-    if (!text.trim()) {
-      await this.channel.sendText(chatId, '用法：/task <任务内容>');
-      return;
-    }
-    if (this.runner.isBusy(chatId)) {
-      await this.channel.sendText(chatId, '⏳ 上一个任务还在执行，先 /stop 或等它完成');
-      return;
-    }
-    try {
-      const ok = this.runner.submit(chatId, text);
-      if (ok) await this.channel.sendText(chatId, `🚀 已开工：${truncate(text, 80)}`);
-    } catch {
-      await this.channel.sendText(chatId, `❌ 找不到 kimi 命令（kimi_bin=${this.cfg.kimiBin}），请检查配置`);
-    }
-  }
+  // ---------------- 飞书会话（0号）回调 ----------------
+  /** wire 流事件 → 进度消息（复用节流渲染机制）。 */
+  private onChatStream(chatId: string, ev: WireEvent): void {
+    // dashboard 进度线（think 不推飞书，太吵）
+    if (ev.kind !== 'think') this.publish(chatId, 'progress', renderWireEvent(ev));
+    // StreamEvent 转换，复用 taskStatus/pushTaskStatus 节流渲染
+    const mapped: StreamEvent | null =
+      ev.kind === 'text' ? { kind: 'text', text: ev.text }
+      : ev.kind === 'tool_call' ? { kind: 'tool_call', tool: ev.tool, text: ev.text }
+      : ev.kind === 'tool_result' ? { kind: 'tool_result', tool: ev.tool, text: ev.text }
+      : null;
+    if (!mapped) return;
 
-  // ---------------- 运行器回调 ----------------
-  onTaskStream(chatId: string, event: StreamEvent): void {
-    // 记录最新状态（assistant 说明文本 + 当前工具），占位消息就绪前到的事件不再丢弃
     const st = this.taskStatus.get(chatId) ?? { lastPush: 0 };
     this.taskStatus.set(chatId, st);
-    if (event.kind === 'text' && event.text?.trim()) st.text = event.text.trim();
-    else if (event.kind === 'tool_call') {
-      st.tool = event.tool;
-      if (event.text?.trim()) st.text = event.text.trim();
+    if (mapped.kind === 'text' && mapped.text?.trim()) st.text = mapped.text.trim();
+    else if (mapped.kind === 'tool_call') {
+      st.tool = mapped.tool;
+      if (mapped.text?.trim()) st.text = mapped.text.trim();
     }
 
     const mid = this.taskMessages.get(chatId);
     if (!mid) {
-      // 占位消息只发一次；就绪后立即渲染当前状态
       if (!this.taskMsgPending.has(chatId)) {
         const p = this.channel.sendText(chatId, '⏳ Kimi Code 执行中…');
         this.taskMsgPending.set(chatId, p);
@@ -916,22 +928,15 @@ export class Bridge {
     void this.channel.updateText(mid, lines.join('\n'));
   }
 
-  async onTaskDone(chatId: string, task: ChatTask, exitCode: number | null, stderrTail: string): Promise<void> {
-    // 占位消息可能在任务结束后才送达，送达后清掉映射避免下个任务复用旧消息
+  /** 一轮结束：发结果消息并清理进度状态。 */
+  private async onChatTurnDone(chatId: string, text: string, tools: string[]): Promise<void> {
     const pend = this.taskMsgPending.get(chatId);
     if (pend) void pend.finally(() => this.taskMessages.delete(chatId));
     this.taskMsgPending.delete(chatId);
     this.taskStatus.delete(chatId);
     this.taskMessages.delete(chatId);
-    let result = task.textParts.join('').trim();
-    if (!result) result = task.rawTail.join('\n').trim();
-    let body: string;
-    if (exitCode !== 0) {
-      body = `⚠️ 任务异常结束（exit=${exitCode}）\n` + truncate(result || stderrTail || '(无输出)');
-    } else {
-      body = '✅ 任务完成\n' + truncate(result || '(无文本输出)');
-    }
-    await this.channel.sendText(chatId, body);
+    const toolLine = tools.length ? `\n🔧 本轮工具：${tools.join('、')}` : '';
+    await this.channel.sendText(chatId, '✅ 本轮完成\n' + truncate(text || '(无文本输出)') + toolLine);
   }
 
   // ---------------- 卡片回调 ----------------
@@ -974,23 +979,21 @@ export class Bridge {
 
 export const HELP_TEXT = `🤖 kimi-code-feishu 使用指南
 
-两种模式：
-💬 飞书任务模式（默认）：直接发消息 = 派 kimi -p 任务（流式回报，危险操作弹审批卡）
-⌨️ 终端模式（/a 绑定后）：直接发消息 = 注入终端会话；/task 才派飞书任务
+会话模型：每个聊天一个常驻交互式 kimi 会话（tmux 托管，编号 0）——上下文连续，模型可以提问（弹卡片作答）。
+💬 飞书模式（默认）：直接发消息 = 发给 0 号会话
+⌨️ 终端模式（/a 绑定后）：直接发消息 = 注入终端会话；/0 发给 0 号会话；/t 注入终端
 
 命令：
-/bind <目录>  绑定本项目的工作目录
-/new          开启新会话（默认会续接上次会话）
-/stop         终止正在执行的任务
-/status       查看当前状态（含当前模式）
-/task <文本>  显式派发飞书任务（终端模式下派任务用）
-/dashboard    临时开启实时输出面板（/d 短别名；public 开公网隧道；off 关闭）
-/a            列出终端会话；/a 序号 绑定进入终端模式；/a free 或 /a 0 释放切回
-/t <文本>     显式注入文本+回车（终端模式下一般不用，直接发消息即可）
-/i <文本>     优先插话：绑定会话=Ctrl+S 立即插入；运行中任务=打断带前缀重启
+/0 <文本>     发给 0 号会话（飞书本身的常驻会话）
+/new          新开会话（杀掉当前 0 号会话重新开始）
+/stop         中断当前轮次（Esc）
+/status       查看当前状态（含模式）
+/bind <目录>  绑定 0 号会话的工作目录
+/a            列出终端会话；/a 序号 绑定进入终端模式；/a free 或 /a 0 切回
+/t <文本>     注入绑定会话（终端的 /命令 也走这里，如 /t /model）
+/i <文本>     优先插话（Ctrl+S，立即插入运行中的轮次）
 /s            查看绑定会话：tmux=实时抓屏；pts=读磁盘转录尾部
-/c            审批池列表；/c 序号或路径 切换（进池的终端会话才弹审批卡）
+/c            审批池；/c 序号或路径 切换（进池的终端会话才弹审批卡）
+/dashboard    实时输出面板（/d 短别名；public 公网隧道；off 关闭）
 /id           查看你的 open_id
-/help         本帮助
-
-提示：终端里手动运行的 kimi 会话也会推送进度与审批到这里（可在配置里关闭）。`;
+/help         本帮助`;

@@ -66,6 +66,8 @@ export interface Config {
   dashboardIdleTimeoutNopage: number;
   /** cloudflared 可执行文件（quick tunnel 用） */
   cloudflaredBin: string;
+  /** kimi 会话转录目录（wire.jsonl 所在）；空 = ~/.kimi-code/sessions */
+  kimiSessionsDir: string;
   /** 飞书对话日志落盘（logs/YYYY-MM-DD.jsonl） */
   logEnabled: boolean;
   /** 日志目录；空 = ~/.kimi-code-feishu/logs */
@@ -99,6 +101,7 @@ export function defaultConfig(): Config {
     dashboardIdleTimeoutPage: 600,
     dashboardIdleTimeoutNopage: 180,
     cloudflaredBin: 'cloudflared',
+    kimiSessionsDir: '',
     logEnabled: true,
     logDir: '',
     logRetentionDays: 30,
@@ -191,6 +194,7 @@ const KEY_MAP: Record<string, keyof Config> = {
   dashboard_idle_timeout_page: 'dashboardIdleTimeoutPage',
   dashboard_idle_timeout_nopage: 'dashboardIdleTimeoutNopage',
   cloudflared_bin: 'cloudflaredBin',
+  kimi_sessions_dir: 'kimiSessionsDir',
   log_enabled: 'logEnabled',
   log_dir: 'logDir',
   log_retention_days: 'logRetentionDays',
