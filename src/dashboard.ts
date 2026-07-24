@@ -215,7 +215,11 @@ const DASHBOARD_HTML = `<!doctype html>
   #dot.on { background: #23d18b; }
   #closeBtn { margin-left: auto; font: inherit; color: #fff; background: #c72e2e; border: none; border-radius: 4px; padding: 3px 10px; cursor: pointer; }
   #closeBtn:hover { background: #e04040; }
-  #log { padding: 8px 12px 40px; white-space: pre-wrap; word-break: break-all; }
+  #log, #logSess, #logConv { padding: 8px 12px 40px; white-space: pre-wrap; word-break: break-all; }
+  #logConv.hidden, #logSess.hidden { display: none; }
+  #tabs { display: flex; gap: 0; border-bottom: 1px solid #333; background: #252526; position: sticky; top: 37px; z-index: 5; }
+  #tabs button { flex: 1; font: inherit; padding: 8px 0; background: none; border: none; color: #888; cursor: pointer; border-bottom: 2px solid transparent; }
+  #tabs button.on { color: #fff; border-bottom-color: #6bcbff; }
   #status { border-bottom: 1px solid #333; }
   .sec { padding: 8px 12px; border-bottom: 1px solid #2a2a2a; }
   .sec h3 { font-size: 12px; color: #999; margin-bottom: 6px; }
@@ -245,16 +249,22 @@ const DASHBOARD_HTML = `<!doctype html>
   <button id="closeBtn">关闭 Dashboard</button>
 </header>
 <div id="status"></div>
-<div class="sec" style="border-bottom:none;padding-bottom:0"><h3>💬 对话与事件（飞书消息 + 任务输出）</h3></div>
-<div id="log"></div>
+<div id="tabs">
+  <button data-tab="sess" class="on">📡 本地会话</button>
+  <button data-tab="conv">💬 飞书对话</button>
+</div>
+<div id="logSess"></div>
+<div id="logConv" class="hidden"></div>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
-const log = document.getElementById('log');
+const logSess = document.getElementById('logSess');
+const logConv = document.getElementById('logConv');
 const filter = document.getElementById('filter');
 const scrollBox = document.getElementById('scroll');
 const dot = document.getElementById('dot');
 const closeBtn = document.getElementById('closeBtn');
 const knownChats = new Set();
+const CONV_KINDS = new Set(['in', 'out', 'progress']); // 飞书对话：消息+卡片/审批事件；其余进本地会话
 
 function fmtTime(ts) {
   const d = new Date(ts);
@@ -273,11 +283,22 @@ function addChat(chatId) {
 
 function applyFilter() {
   const want = filter.value;
-  for (const el of log.children) {
-    el.classList.toggle('hide', !!want && el.dataset.chat !== want);
+  for (const container of [logSess, logConv]) {
+    for (const el of container.children) {
+      el.classList.toggle('hide', !!want && el.dataset.chat !== want);
+    }
   }
 }
 filter.onchange = applyFilter;
+
+// 标签页切换
+for (const btn of document.querySelectorAll('#tabs button')) {
+  btn.onclick = () => {
+    for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('on', b === btn);
+    logSess.classList.toggle('hidden', btn.dataset.tab !== 'sess');
+    logConv.classList.toggle('hidden', btn.dataset.tab !== 'conv');
+  };
+}
 
 function append(ev) {
   addChat(ev.chatId);
@@ -289,7 +310,7 @@ function append(ev) {
   const x = document.createElement('span'); x.className = 'text'; x.textContent = ev.text;
   line.append(t, c, x);
   if (filter.value && ev.chatId !== filter.value) line.classList.add('hide');
-  log.appendChild(line);
+  (CONV_KINDS.has(ev.kind) ? logConv : logSess).appendChild(line);
   if (scrollBox.checked) window.scrollTo(0, document.body.scrollHeight);
 }
 
@@ -307,7 +328,7 @@ es.onerror = () => {
     b.id = 'banner';
     b.style.cssText = 'position:sticky;top:0;background:#5a1d1d;color:#ffd7d7;padding:10px 12px;font-weight:bold;z-index:9';
     b.textContent = '⚠️ 连接已断开：Dashboard 已关闭或网络中断（可在飞书发 /dashboard 重新开启）';
-    document.body.insertBefore(b, log);
+    document.body.insertBefore(b, logSess);
   }
 };
 es.onmessage = (m) => { try { append(JSON.parse(m.data)); } catch {} };

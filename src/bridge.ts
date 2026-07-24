@@ -624,7 +624,9 @@ export class Bridge {
     }
 
     const [cmdRaw, ...rest] = text.trim().split(/\s+/);
-    const cmd = cmdRaw.toLowerCase();
+    // /d 是 /dashboard 的短别名
+    const alias: Record<string, string> = { '/d': '/dashboard' };
+    const cmd = alias[cmdRaw.toLowerCase()] ?? cmdRaw.toLowerCase();
     const arg = rest.join(' ');
 
     if (cmd === '/bind') {
@@ -939,7 +941,7 @@ export const HELP_TEXT = `🤖 kimi-code-feishu 使用指南
 /new          开启新会话（默认会续接上次会话）
 /stop         终止正在执行的任务
 /status       查看当前状态
-/dashboard    临时开启实时输出面板（默认本地链接；/dashboard public 开公网隧道；/dashboard off 关闭）
+/dashboard    临时开启实时输出面板（/d 短别名；/dashboard public 开公网隧道；/dashboard off 关闭）
 /a            列出终端 tmux 会话；/a 序号 绑定到本聊天
 /t <文本>     向绑定会话注入文本+回车（空文本=只回车）
 /i <文本>     优先插话：绑定会话=Ctrl+S 立即插入；运行中任务=打断带前缀重启

@@ -335,6 +335,11 @@ async function main(): Promise<void> {
     check('Dashboard命令: 默认开启本地链接',
       channel.texts().some((t) => t.includes('已开启') && t.includes('127.0.0.1') && !t.includes('trycloudflare')));
 
+    // /d 短别名（重复开启幂等，返回当前链接）
+    const textsBeforeD = channel.texts().length;
+    await bridge.onFeishuMessage('chat-1', 'ou_boss', '/d');
+    check('Dashboard命令: /d 别名生效', channel.texts().length > textsBeforeD && channel.texts().slice(textsBeforeD).some((t) => t.includes('Dashboard')));
+
     await bridge.onFeishuMessage('chat-1', 'ou_boss', '/dashboard public');
     check('Dashboard命令: public 开启隧道链接', channel.texts().some((t) => t.includes('fake-tunnel-xyz.trycloudflare.com')));
 
@@ -525,6 +530,7 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
     const status = (await r4.json()) as { sessions?: unknown[]; marker?: string };
     check('Dashboard: /api/status 返回状态面板数据', r4.status === 200 && status.marker === 'st-1');
     check('Dashboard: 页面含状态区', html.includes('id="status"'));
+    check('Dashboard: 页面分隔双标签页', html.includes('本地会话') && html.includes('飞书对话') && html.includes('logSess') && html.includes('logConv'));
 
     const r5 = await fetch(`${base}/api/screen?target=%251&token=tok123`);
     const screen = (await r5.json()) as { screen?: string };
