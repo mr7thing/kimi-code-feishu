@@ -618,6 +618,11 @@ echo '{"role":"assistant","content":"完成：一切正常"}'
         await sleep(300);
         check('终端模式: 纯文本自动注入会话', (await captureTmux(target, 5)).includes('hello-auto-inject'));
 
+        // 终端模式：桥不认识的 /命令 透传注入（如 /model）
+        await bridge.onFeishuMessage('chat-t', 'ou_boss', '/model');
+        await sleep(300);
+        check('终端模式: 未识别的 /命令 透传注入', (await captureTmux(target, 5)).includes('/model'));
+
         // /task 显式派任务（绑定不影响）；随后 /a free 释放
         const fakeSleep = path.join(tmp, 'fake_sleep');
         fs.writeFileSync(fakeSleep, '#!/bin/sh\nsleep 30\n', 'utf-8');
